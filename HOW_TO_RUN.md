@@ -1,20 +1,20 @@
-# How to Run the Brand Asset Pipeline v3
+# How to Run the Brand Asset Pipeline v4
 
 ## What you'll get
 A folder (e.g. `batch_1_assets/`) with:
 - **Each brand's logo** (transparent, square, 500x500 minimum) — plus SVG if found
-- **Shape previews** (circle, square, card) for each brand
-- **review.html** — interactive review page with colour overrides, mark-as-final, categories, export
+- **review.html** — interactive review page with expandable cards, logo picker, colour overrides, SVG recolour, mark-as-final, and export (JSON / CSV / ZIP)
 - **review.csv** — spreadsheet with colours, confidence scores, blending risks
+- **pipeline_summary.json** — full processing results
 
-### New in v3
-- Auto-categorisation (Food & Beverage, Fashion, Electronics, Travel, etc.)
-- Website text scraping (meta descriptions + homepage + about page)
-- Logo validation (flags wrong images — bad aspect ratio, too few colours, too uniform)
-- **Colour override** — pick any custom background colour per brand
-- **Mark as final** — lock in brands you're happy with
-- **Export** — download JSON or CSV of finalised brands only
-- **Progress bar** — track how many brands you've reviewed
+### New in v4
+- **Expandable detail panel** — click any card to see full info, pick between logo options, recolour SVGs, compare sources
+- **Multi-candidate logos** — `--multi` flag collects up to 5 logo options per brand from different sources
+- **Parallel processing** — `--threads 4` processes brands concurrently (much faster)
+- **Seeklogo.com** — new Tier 7 source for vector logos (9 tiers total)
+- **ZIP export** — downloads a zip with all finalized logos + data files
+- **Source effectiveness report** — tells you which tiers are working and which have zero hits
+- **Website links** on each card — click to verify against the brand's actual site
 
 ---
 
@@ -72,14 +72,23 @@ This downloads everything including the AI model for background removal (~170MB)
 ---
 
 ### Step 7: Run batch 1
+
+**Quick run (first match wins, sequential):**
 ```
 python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets
 ```
 
+**Recommended run (multi-candidate logos + parallel processing):**
+```
+python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --multi --threads 4
+```
+
 **What happens:**
 - Progress line for each brand (1/100, 2/100...)
-- Takes ~10-20 minutes for 100 brands (fetching logos + AI background removal)
-- Console symbols: ✅ = good, ⚠️ = needs attention, ❌ = couldn't find logo, [SVG] = vector found, [!] = logo flagged by validation
+- Quick run: ~10-20 minutes for 100 brands
+- Multi + threads: ~15-20 minutes (more work per brand, but parallel)
+- Console symbols: ✅ = good, ⚠️ = needs attention, ❌ = couldn't find logo, [SVG] = vector found, [3 opts] = multiple logo options found
+- At the end: source effectiveness table showing hits per tier
 
 ---
 
@@ -92,22 +101,29 @@ open batch_1_assets/review.html
 
 ## Using the review page
 
-### Toolbar (top)
+### Grid view (default)
 - **Shape toggle**: Square / Circle / Card — changes ALL cards at once
 - **Size slider**: make cards bigger or smaller
-- **Sort by**: Name, Confidence, Blending Risk, Source Tier
+- **Sort by**: Name, Confidence, Blending Risk, Source Tier, Category
 - **Category filter**: dropdown to show one category at a time
-- **Filter buttons**: Finalized / Pending / Flagged / Logo Issues
+- **Filter buttons**: All / Finalized / Pending / Flagged / Low risk / High risk / SVG / Logo issues
+- **Colour swatches** on each card: click to change background colour
+- **Mark as Final / Flag** buttons on each card
 
-### Per-card controls
-- **Colour swatches**: click any swatch to preview that background colour
-- **Colour picker** (paint icon): pick ANY custom colour with the native colour wheel
-- **Mark as Final** (checkmark button): locks the brand with current colour — card gets a green border
-- **Flag button**: mark brands needing manual attention
+### Expanded detail view (click any card)
+- **Larger logo preview** with the selected background colour
+- **Logo picker** — if you used `--multi`, you'll see all logo options side by side. Click one to switch.
+- **SVG recolour** — for SVG logos, one-click White/Black or pick any colour. The logo's fills get replaced live.
+- **Background colour swatches** — bigger, easier to compare
+- **Source info** — tier, source URL, dimensions, confidence
+- **Website link** — opens the brand's website in a new tab
+- Press **Escape** or click outside to close
 
-### When you're done reviewing
-- Click **Export JSON** or **Export CSV** at the top — downloads ONLY the finalised brands with your chosen colours
-- The progress bar shows how many brands you've finalised out of total
+### Exporting
+- **Export JSON** — finalized brands with full metadata
+- **Export CSV** — same data, flat format
+- **Export ZIP** — downloads a zip containing: `logos/Brand_Name.png` for each finalized brand, plus `brand_data.csv` and `brand_data.json`
+- The progress bar shows how many brands you've finalized out of total
 
 ---
 
@@ -115,7 +131,7 @@ open batch_1_assets/review.html
 
 Once you're happy with batch 1:
 ```
-python brand_asset_pipeline.py --input batch_2_brands.csv --output batch_2_assets
+python brand_asset_pipeline.py --input batch_2_brands.csv --output batch_2_assets --multi --threads 4
 open batch_2_assets/review.html
 ```
 
@@ -123,29 +139,35 @@ And so on for batch_3 through batch_6.
 
 ---
 
-## Fine-tuning background removal
+## All CLI options
 
-If some logos have messy edges, try different models:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input FILE` | (required) | Input CSV file |
+| `--output DIR` | `./brand_assets` | Output directory |
+| `--sample N` | `0` (all) | Process N random brands (0 = all rows) |
+| `--multi` | off | Collect up to 5 logo candidates per brand from multiple tiers |
+| `--threads N` | `1` | Parallel threads (recommended: 4) |
+| `--rembg-model MODEL` | `u2net` | BG removal model: `u2net`, `u2net_human_seg`, `isnet-general-use` |
+| `--alpha-matting` | off | Cleaner edges on BG removal (slower) |
 
-**Default (general purpose):**
-```
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets
-```
+---
 
-**isnet model (often better for logos with clean edges):**
-```
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --rembg-model isnet-general-use
-```
+## Logo sourcing tiers (in order)
 
-**Alpha matting (cleaner edges, slower):**
-```
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --alpha-matting
-```
+| Tier | Source | Type |
+|------|--------|------|
+| 0 | CSV-provided URL | Direct link |
+| 1 | Brandfetch / logo.dev | CDN + API |
+| 2 | Website scraping | HTML parsing |
+| 3 | Wikimedia Commons / Wikipedia | Search API |
+| 4 | Google Favicon | Free API |
+| 5 | DuckDuckGo | Instant Answer API |
+| 6 | Gilbarbara SVG repo | GitHub (2000+ brands) |
+| 7 | Seeklogo.com | Search + scrape |
+| 8 | Simple Icons | CDN (3000+ SVGs) |
 
-**Both together:**
-```
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --rembg-model isnet-general-use --alpha-matting
-```
+Without `--multi`, the script stops at the first tier that finds a logo. With `--multi`, it collects from all tiers (up to 5 candidates) so you can pick the best one.
 
 ---
 
@@ -160,6 +182,7 @@ python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_asset
 | Blue **SVG** | Vector logo found (best quality) |
 | Yellow **UPSCALED** | Original logo was under 500px |
 | Red **!** | Logo validation flagged issues (wrong image?) |
+| Grey **N opts** | Number of logo candidates available (with --multi) |
 
 ---
 
@@ -175,10 +198,13 @@ Make sure you activated the venv first: `source brand_env/bin/activate`, then ru
 You forgot to activate the venv. Run: `source brand_env/bin/activate`
 
 **Script is very slow**
-First brand takes longer (downloading the AI model). After that, ~5-10 seconds per brand.
+First brand takes longer (downloading the AI model). After that, ~5-10 seconds per brand. Use `--threads 4` to speed up.
 
 **cairosvg install fails**
 Try: `brew install cairo` first, then `pip install cairosvg`. Or skip it — SVGs will still be saved, just not rasterised.
 
 **Lots of failures**
-Some brands don't have good logos online. That's expected. The 8-tier waterfall catches most, but some niche brands will need manual sourcing.
+Some brands don't have good logos online. That's expected. Check the source effectiveness table at the end — if a tier has zero hits, it may not be useful for your brand set.
+
+**ZIP export button doesn't work**
+The ZIP feature requires internet access (loads JSZip from CDN). If you're offline, use JSON or CSV export instead.
