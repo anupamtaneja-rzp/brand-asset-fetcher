@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Brand Asset Pipeline — PoC v2
+Brand Asset Pipeline — v4
 ===============================
 Automatically sources brand logos (SVG preferred), removes backgrounds,
 extracts brand colours, and generates an interactive HTML review page.
 
 Sourcing tiers (in order):
+    0. CSV-provided logo URL (if present in input)
     1. Brandfetch (logo.dev CDN + search API)
     2. Website scraping (apple-touch-icon, og:image, SVG, img-logo, favicon)
     3. Wikimedia Commons + Wikipedia (often has SVG logos for well-known brands)
     4. Google Favicon API (low quality, but wide coverage)
     5. DuckDuckGo Instant Answer (free, returns brand images)
     6. Gilbarbara SVG logo repo (2000+ brand SVGs on GitHub)
-    7. Simple Icons (3000+ brand SVGs + brand colours)
+    7. Seeklogo.com (large vector logo collection)
+    8. Simple Icons (3000+ brand SVGs + brand colours)
 
 Setup (one time):
     python3 -m venv brand_env && source brand_env/bin/activate
@@ -34,7 +36,7 @@ Output: ./brand_assets/<brand>/  with logo.png, logo.svg (if found), meta.json
         ./brand_assets/review.csv    (spreadsheet for review)
 """
 
-import argparse, csv, json, os, re, sys, time, hashlib, base64
+import argparse, csv, json, os, re, sys, time, hashlib, base64, concurrent.futures
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from io import BytesIO
@@ -54,6 +56,12 @@ try:
 except ImportError:
     HAS_CAIROSVG = False
 
+# ─── GLOBAL CONFIG (set by CLI args in main()) ────────────────────────────────
+OUT_DIR = Path("./brand_assets")
+REMBG_MODEL = "u2net"
+ALPHA_MATTING = False
+MULTI_CANDIDATES = False
+TARGET_SIZE = 500
 
 # ─── SAFE JSON ENCODER ─────────────────────────────────────────────────────────
 
@@ -608,9 +616,86 @@ def tier6_gilbarbara(brand_name: str) -> dict | None:
     return None
 
 
-# ─── TIER 7: SIMPLE ICONS ──────────────────────────────────────────────────
+# ─── TIER 7: SEEKLOGO ──────────────────────────────────────────────────────
 
-def tier7_simple_icons(brand_name: str) -> dict | None:
+def tier7_seeklogo(brand_name: str) -> dict | None:
+    """
+    seeklogo.com — large collection of vector logos.
+    Scrapes the search page for SVG download links.
+    """
+    slug = brand_name.lower().replace(" ", "+")
+    search_url = f"https://seeklogo.com/search?q={slug}"
+    try:
+        resp = requests.get(search_url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Find first logo result link
+        result_link = soup.select_one("a.logo-item, a[href*='/vector-logos/'], .search-results a[href*='logo']")
+        if not result_link:
+            # Try broader: any link to a logo detail page
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/vector-logos/" in href or "-logo-" in href:
+                    result_link = a
+                    break
+        if not result_link:
+            return None
+
+        detail_url = result_link["href"]
+        if not detail_url.startswith("http"):
+            detail_url = urljoin("https://seeklogo.com", detail_url)
+
+        # Fetch detail page to find the SVG/PNG download
+        resp2 = requests.get(detail_url, headers=HEADERS, timeout=TIMEOUT)
+        if resp2.status_code != 200:
+            return None
+        soup2 = BeautifulSoup(resp2.text, "html.parser")
+
+        # Look for download link (SVG preferred, then PNG)
+        img_url = None
+        is_svg = False
+        for a in soup2.find_all("a", href=True):
+            href = a["href"]
+            if ".svg" in href.lower():
+                img_url = href if href.startswith("http") else urljoin(detail_url, href)
+                is_svg = True
+                break
+        if not img_url:
+            # Try PNG
+            for a in soup2.find_all("a", href=True):
+                href = a["href"]
+                if ".png" in href.lower() and ("download" in a.text.lower() or "logo" in href.lower()):
+                    img_url = href if href.startswith("http") else urljoin(detail_url, href)
+                    break
+        # Also try og:image as fallback
+        if not img_url:
+            og = soup2.find("meta", property="og:image")
+            if og and og.get("content"):
+                img_url = og["content"]
+
+        if not img_url:
+            return None
+
+        img, found_svg, svg_raw = _fetch_image(img_url)
+        if not img:
+            return None
+
+        result = {
+            "source": "seeklogo",
+            "image": img, "is_svg": is_svg or found_svg,
+            "url": img_url, "confidence": 0.7,
+        }
+        if svg_raw:
+            result["svg_data"] = svg_raw
+        return result
+    except:
+        return None
+
+
+# ─── TIER 8: SIMPLE ICONS ──────────────────────────────────────────────────
+
+def tier8_simple_icons(brand_name: str) -> dict | None:
     """
     Simple Icons — 3000+ brand SVGs. Free CDN.
     https://cdn.simpleicons.org/{slug}
@@ -1103,6 +1188,7 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
             "logo_quality_score": r.get("logo_quality_score", 1.0),
             "logo_issues": r.get("logo_issues", []),
             "logo_b64": logo_b64,
+            "logo_candidates": r.get("logo_candidates", []),
         })
 
     brands_json = json.dumps(brands_js, cls=SafeEncoder)
@@ -1114,17 +1200,12 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Brand Asset Pipeline — Review</title>
+<title>Brand Asset Pipeline v4 — Review</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
   body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f5f5f5; color:#222; }}
-
-  .toolbar {{
-    position:sticky; top:0; z-index:100;
-    background:#1a1a2e; color:#fff; padding:12px 24px;
-    display:flex; align-items:center; gap:20px; flex-wrap:wrap;
-    box-shadow:0 2px 12px rgba(0,0,0,0.15);
-  }}
+  .toolbar {{ position:sticky; top:0; z-index:100; background:#1a1a2e; color:#fff; padding:12px 24px; display:flex; align-items:center; gap:20px; flex-wrap:wrap; box-shadow:0 2px 12px rgba(0,0,0,0.15); }}
   .toolbar h1 {{ font-size:18px; font-weight:600; white-space:nowrap; }}
   .toolbar label {{ font-size:12px; opacity:0.7; }}
   .toolbar select, .toolbar input[type=range] {{ cursor:pointer; }}
@@ -1135,21 +1216,25 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
   .stats span {{ white-space:nowrap; }}
   .progress-bar {{ width:120px; height:6px; background:#333; border-radius:3px; overflow:hidden; }}
   .progress-fill {{ height:100%; background:#4caf50; transition:width 0.3s; }}
-
   .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(var(--card-w,200px),1fr)); gap:16px; padding:24px; }}
-  .card {{ background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); transition:box-shadow 0.2s; }}
+  .card {{ background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08); transition:box-shadow 0.2s; cursor:pointer; }}
   .card:hover {{ box-shadow:0 4px 16px rgba(0,0,0,0.12); }}
   .card.flagged {{ outline:3px solid #ff4444; }}
   .card.finalized {{ outline:3px solid #4caf50; }}
-  .card-preview {{ aspect-ratio:1; display:flex; align-items:center; justify-content:center; overflow:hidden; }}
+  .card-preview {{ aspect-ratio:1; display:flex; align-items:center; justify-content:center; overflow:hidden; position:relative; }}
   .card-preview.shape-circle {{  }}
   .card-preview.shape-card {{ aspect-ratio:14/9; }}
   .card-preview img {{ width:60%; height:60%; object-fit:contain; transition:all 0.2s; }}
   .shape-circle img {{ border-radius:50%; }}
+  .card-preview .svg-overlay {{ width:60%; height:60%; display:flex; align-items:center; justify-content:center; }}
+  .card-preview .svg-overlay svg {{ width:100%; height:100%; }}
+  .card-preview .expand-hint {{ position:absolute; bottom:4px; right:6px; font-size:9px; color:rgba(255,255,255,0.7); background:rgba(0,0,0,0.3); padding:1px 5px; border-radius:4px; pointer-events:none; }}
   .card-meta {{ padding:10px 12px; font-size:11px; line-height:1.6; border-top:1px solid #f0f0f0; }}
   .card-meta .brand-name {{ font-weight:600; font-size:13px; margin-bottom:2px; }}
   .card-meta .meta-row {{ display:flex; justify-content:space-between; color:#666; }}
   .card-meta .description {{ font-size:10px; color:#888; margin-top:4px; max-height:32px; overflow:hidden; }}
+  .website-link {{ font-size:10px; color:#1a73e8; text-decoration:none; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .website-link:hover {{ text-decoration:underline; }}
   .category-tag {{ display:inline-block; font-size:9px; padding:1px 6px; border-radius:10px; background:#eef; color:#336; margin-right:4px; }}
   .badge {{ display:inline-block; font-size:9px; padding:2px 5px; border-radius:4px; font-weight:600; text-transform:uppercase; }}
   .badge-low {{ background:#e6f9ed; color:#1b7a3d; }}
@@ -1168,38 +1253,60 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
   .risk-dot {{ width:5px; height:5px; border-radius:50%; position:absolute; top:1px; right:1px; }}
   .risk-dot.r-low {{ background:#28a745; }} .risk-dot.r-medium {{ background:#ff9800; }} .risk-dot.r-high {{ background:#dc3545; }}
   .card-actions {{ display:flex; gap:4px; margin-top:6px; }}
-  .btn-final {{ flex:1; padding:4px 8px; border:1px solid #4caf50; border-radius:6px; background:#fff; color:#4caf50; font-size:10px; font-weight:600; cursor:pointer; transition:all 0.15s; }}
+  .btn-final {{ flex:1; padding:4px 8px; border:1px solid #4caf50; border-radius:6px; background:#fff; color:#4caf50; font-size:10px; font-weight:600; cursor:pointer; }}
   .btn-final:hover {{ background:#e8f5e9; }}
   .btn-final.done {{ background:#4caf50; color:#fff; }}
   .btn-flag {{ padding:4px 8px; border:1px solid #ff5722; border-radius:6px; background:#fff; color:#ff5722; font-size:10px; cursor:pointer; }}
   .btn-flag:hover {{ background:#fbe9e7; }}
   .btn-flag.active {{ background:#ff5722; color:#fff; }}
-  .btn-recolour {{ padding:4px 8px; border:1px solid #1a73e8; border-radius:6px; background:#fff; color:#1a73e8; font-size:10px; cursor:pointer; }}
-  .btn-recolour:hover {{ background:#e8f0fe; }}
-  .btn-recolour.active {{ background:#1a73e8; color:#fff; }}
-  .recolour-row {{ display:none; margin-top:4px; align-items:center; gap:6px; }}
-  .recolour-row.visible {{ display:flex; }}
-  .recolour-row label {{ font-size:9px; color:#666; }}
-  .recolour-input {{ width:24px; height:24px; border:1px solid #ccc; border-radius:5px; cursor:pointer; padding:0; }}
-  .website-link {{ font-size:10px; color:#1a73e8; text-decoration:none; word-break:break-all; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-  .website-link:hover {{ text-decoration:underline; }}
-  .card-preview .svg-overlay {{ width:60%; height:60%; display:flex; align-items:center; justify-content:center; }}
-  .card-preview .svg-overlay svg {{ width:100%; height:100%; }}
+  .filter-bar {{ padding:6px 24px; background:#fff; border-bottom:1px solid #eee; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }}
+  .filter-btn {{ padding:3px 10px; border:1px solid #ddd; border-radius:16px; background:#fff; font-size:11px; cursor:pointer; }}
+  .filter-btn:hover {{ background:#f0f0f0; }}
+  .filter-btn.active {{ background:#1a1a2e; color:#fff; border-color:#1a1a2e; }}
+  .export-bar {{ padding:12px 24px; background:#fff; border-top:1px solid #eee; position:sticky; bottom:0; display:flex; align-items:center; gap:12px; z-index:50; flex-wrap:wrap; }}
+  .btn-export {{ padding:8px 20px; background:#1a1a2e; color:#fff; border:none; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; }}
+  .btn-export:hover {{ background:#2a2a4e; }}
   .failed-section {{ padding:0 24px 24px; }}
   .failed-section h2 {{ font-size:14px; color:#888; margin-bottom:8px; }}
   .failed-item {{ font-size:12px; color:#999; padding:2px 0; }}
-  .filter-bar {{ padding:6px 24px; background:#fff; border-bottom:1px solid #eee; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }}
-  .filter-btn {{ padding:3px 10px; border:1px solid #ddd; border-radius:16px; background:#fff; font-size:11px; cursor:pointer; transition:all 0.15s; }}
-  .filter-btn:hover {{ background:#f0f0f0; }}
-  .filter-btn.active {{ background:#1a1a2e; color:#fff; border-color:#1a1a2e; }}
-  .export-bar {{ padding:12px 24px; background:#fff; border-top:1px solid #eee; position:sticky; bottom:0; display:flex; align-items:center; gap:16px; z-index:50; }}
-  .btn-export {{ padding:8px 20px; background:#1a1a2e; color:#fff; border:none; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; }}
-  .btn-export:hover {{ background:#2a2a4e; }}
+
+  /* ─── EXPANDED DETAIL PANEL ─── */
+  .detail-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:200; justify-content:center; align-items:center; }}
+  .detail-overlay.open {{ display:flex; }}
+  .detail-panel {{ background:#fff; border-radius:16px; width:90vw; max-width:900px; max-height:90vh; overflow-y:auto; box-shadow:0 8px 40px rgba(0,0,0,0.25); }}
+  .detail-header {{ display:flex; align-items:center; gap:16px; padding:20px 24px; border-bottom:1px solid #eee; }}
+  .detail-header h2 {{ font-size:20px; font-weight:600; flex:1; }}
+  .detail-header .close-btn {{ width:32px; height:32px; border-radius:50%; border:none; background:#f0f0f0; font-size:18px; cursor:pointer; display:flex; align-items:center; justify-content:center; }}
+  .detail-header .close-btn:hover {{ background:#ddd; }}
+  .detail-body {{ padding:24px; display:grid; grid-template-columns:1fr 1fr; gap:24px; }}
+  .detail-left {{ display:flex; flex-direction:column; gap:16px; }}
+  .detail-preview {{ aspect-ratio:1; border-radius:12px; display:flex; align-items:center; justify-content:center; max-height:300px; }}
+  .detail-preview img {{ width:60%; height:60%; object-fit:contain; }}
+  .detail-preview .svg-overlay {{ width:60%; height:60%; display:flex; align-items:center; justify-content:center; }}
+  .detail-preview .svg-overlay svg {{ width:100%; height:100%; }}
+  .detail-right {{ display:flex; flex-direction:column; gap:12px; }}
+  .detail-info {{ font-size:13px; line-height:1.8; }}
+  .detail-info dt {{ font-weight:600; color:#666; font-size:11px; text-transform:uppercase; }}
+  .detail-info dd {{ margin-bottom:8px; }}
+  .logo-picker {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(120px,1fr)); gap:10px; }}
+  .logo-option {{ border:2px solid #eee; border-radius:10px; padding:8px; text-align:center; cursor:pointer; transition:all 0.15s; background:#fff; }}
+  .logo-option:hover {{ border-color:#1a73e8; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
+  .logo-option.selected {{ border-color:#4caf50; background:#f0faf0; }}
+  .logo-option img {{ width:80px; height:80px; object-fit:contain; display:block; margin:0 auto 6px; }}
+  .logo-option .lo-label {{ font-size:10px; color:#666; }}
+  .logo-option .lo-source {{ font-size:9px; color:#999; }}
+  .recolour-section {{ padding:12px 0; border-top:1px solid #eee; }}
+  .recolour-section h4 {{ font-size:12px; color:#666; margin-bottom:8px; }}
+  .recolour-controls {{ display:flex; align-items:center; gap:10px; }}
+  .recolour-controls input[type=color] {{ width:36px; height:36px; border:2px solid #ddd; border-radius:8px; cursor:pointer; }}
+  .recolour-controls button {{ padding:6px 12px; border:1px solid #ccc; border-radius:6px; background:#fff; font-size:11px; cursor:pointer; }}
+  .colour-section h4 {{ font-size:12px; color:#666; margin-bottom:6px; }}
+  @media (max-width:700px) {{ .detail-body {{ grid-template-columns:1fr; }} }}
 </style>
 </head>
 <body>
 <div class="toolbar">
-  <h1>Brand Assets Review</h1>
+  <h1>Brand Assets v4</h1>
   <div class="control-group"><label>Shape</label>
     <select id="shapeSelect"><option value="square">Square</option><option value="circle">Circle</option><option value="card">Card (14:9)</option></select>
   </div>
@@ -1236,9 +1343,15 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
 <div class="failed-section" id="failedSection"></div>
 
 <div class="export-bar">
-  <button class="btn-export" onclick="exportFinal()">Export finalized brands (JSON)</button>
-  <button class="btn-export" style="background:#555;" onclick="exportCSV()">Export as CSV</button>
+  <button class="btn-export" onclick="exportJSON()">Export JSON</button>
+  <button class="btn-export" style="background:#555;" onclick="exportCSV()">Export CSV</button>
+  <button class="btn-export" style="background:#2e7d32;" onclick="exportZIP()">Export ZIP (assets + data)</button>
   <span id="exportStatus" style="font-size:12px;color:#666;"></span>
+</div>
+
+<!-- Detail overlay -->
+<div class="detail-overlay" id="detailOverlay" onclick="if(event.target===this)closeDetail()">
+  <div class="detail-panel" id="detailPanel"></div>
 </div>
 
 <script>
@@ -1249,18 +1362,26 @@ const CATEGORIES = {categories_json};
 let finalized = new Set();
 let flagged = new Set();
 let selectedColours = {{}};
-let logoRecolours = {{}};  // folder -> hex or null
+let selectedLogos = {{}};   // folder -> candidate index
+let logoRecolours = {{}};
 let activeFilter = "all";
 let activeCategory = "all";
 BRANDS.forEach(b => {{ selectedColours[b.folder] = b.colour; }});
 
-// Populate category dropdown
 const catSel = document.getElementById("categorySelect");
 CATEGORIES.forEach(c => {{ const o = document.createElement("option"); o.value = c; o.textContent = c; catSel.appendChild(o); }});
 
 function getActiveColour(b) {{ return selectedColours[b.folder] || b.colour; }}
+function getActiveLogo(b) {{
+  const idx = selectedLogos[b.folder];
+  if (idx !== undefined && b.logo_candidates && b.logo_candidates[idx]) {{
+    return b.logo_candidates[idx].thumb_b64;
+  }}
+  return b.logo_b64;
+}}
 
-function switchColour(folder, hex) {{
+function switchColour(folder, hex, evt) {{
+  if (evt) evt.stopPropagation();
   selectedColours[folder] = hex;
   const card = document.querySelector(`.card[data-folder="${{folder}}"]`);
   if (!card) return;
@@ -1270,60 +1391,193 @@ function switchColour(folder, hex) {{
   if (hexSpan) hexSpan.textContent = hex;
 }}
 
-function customColour(folder, inputEl) {{
+function customColour(folder, inputEl, evt) {{
+  if (evt) evt.stopPropagation();
   switchColour(folder, inputEl.value);
+}}
+
+function selectLogo(folder, candIdx) {{
+  selectedLogos[folder] = candIdx;
+  const b = BRANDS.find(x => x.folder === folder);
+  if (!b) return;
+  // Update detail panel preview
+  const cand = b.logo_candidates[candIdx];
+  const preview = document.querySelector("#detailPanel .detail-preview");
+  if (preview) {{
+    const img = preview.querySelector("img");
+    if (img && cand.thumb_b64) img.src = "data:image/png;base64," + cand.thumb_b64;
+  }}
+  // Mark selected in picker
+  document.querySelectorAll("#detailPanel .logo-option").forEach((el, i) => {{
+    el.classList.toggle("selected", i === candIdx);
+  }});
+  // Update grid card too
+  renderGrid();
 }}
 
 function recolourSVG(folder, hex) {{
   logoRecolours[folder] = hex;
-  const card = document.querySelector(`.card[data-folder="${{folder}}"]`);
-  if (!card) return;
-  const overlay = card.querySelector(".svg-overlay");
-  if (!overlay) return;
+  // Update detail panel preview if open
   const b = BRANDS.find(x => x.folder === folder);
-  if (!b || !b.svg_markup) return;
-  // Replace fill and stroke colours in the SVG markup
-  let svg = b.svg_markup;
-  // Replace fill="..." but not fill="none" or fill="url(...)"
-  svg = svg.replace(/fill="(?!none|url)([^"]*)"/gi, `fill="${{hex}}"`);
-  svg = svg.replace(/stroke="(?!none|url)([^"]*)"/gi, `stroke="${{hex}}"`);
-  // Also handle style="fill:..." inline
-  svg = svg.replace(/fill:\s*(?!none|url)[^;"]+/gi, `fill:${{hex}}`);
-  svg = svg.replace(/stroke:\s*(?!none|url)[^;"]+/gi, `stroke:${{hex}}`);
-  overlay.innerHTML = svg;
-  overlay.style.display = "flex";
-  // Hide the PNG img
-  const img = card.querySelector(".card-preview img");
-  if (img) img.style.display = "none";
+  if (!b) return;
+  const svgSrc = _getActiveSvgMarkup(b);
+  if (!svgSrc) return;
+  const recoloured = _applyRecolour(svgSrc, hex);
+  const overlay = document.querySelector("#detailPanel .detail-preview .svg-overlay");
+  if (overlay) {{
+    overlay.innerHTML = recoloured;
+    overlay.style.display = "flex";
+    const img = document.querySelector("#detailPanel .detail-preview img");
+    if (img) img.style.display = "none";
+  }}
+  renderGrid();
 }}
 
 function resetLogoColour(folder) {{
   delete logoRecolours[folder];
-  const card = document.querySelector(`.card[data-folder="${{folder}}"]`);
-  if (!card) return;
-  const overlay = card.querySelector(".svg-overlay");
-  if (overlay) {{ overlay.innerHTML = ""; overlay.style.display = "none"; }}
-  const img = card.querySelector(".card-preview img");
-  if (img) img.style.display = "";
+  renderGrid();
+  // Refresh detail panel if open
+  const b = BRANDS.find(x => x.folder === folder);
+  if (b) openDetail(b.folder);
 }}
 
-function toggleRecolourRow(folder) {{
-  const card = document.querySelector(`.card[data-folder="${{folder}}"]`);
-  if (!card) return;
-  const row = card.querySelector(".recolour-row");
-  if (row) row.classList.toggle("visible");
+function _getActiveSvgMarkup(b) {{
+  const idx = selectedLogos[b.folder];
+  if (idx !== undefined && b.logo_candidates[idx] && b.logo_candidates[idx].svg_markup) {{
+    return b.logo_candidates[idx].svg_markup;
+  }}
+  return b.svg_markup || "";
 }}
 
-function toggleFinal(folder) {{
+function _applyRecolour(svg, hex) {{
+  svg = svg.replace(/fill="(?!none|url)([^"]*)"/gi, `fill="${{hex}}"`);
+  svg = svg.replace(/stroke="(?!none|url)([^"]*)"/gi, `stroke="${{hex}}"`);
+  svg = svg.replace(/fill:\\s*(?!none|url)[^;"]+/gi, `fill:${{hex}}`);
+  svg = svg.replace(/stroke:\\s*(?!none|url)[^;"]+/gi, `stroke:${{hex}}`);
+  return svg;
+}}
+
+function toggleFinal(folder, evt) {{
+  if (evt) evt.stopPropagation();
   if (finalized.has(folder)) finalized.delete(folder); else finalized.add(folder);
   renderGrid();
 }}
 
-function toggleFlag(folder) {{
+function toggleFlag(folder, evt) {{
+  if (evt) evt.stopPropagation();
   if (flagged.has(folder)) flagged.delete(folder); else flagged.add(folder);
   renderGrid();
 }}
 
+// ─── DETAIL PANEL ───
+function openDetail(folder) {{
+  const b = BRANDS.find(x => x.folder === folder);
+  if (!b) return;
+  const ac = getActiveColour(b);
+  const hasSvg = _getActiveSvgMarkup(b).length > 0;
+  const recolourHex = logoRecolours[b.folder] || "";
+
+  // Preview: show recoloured SVG if applicable, else PNG
+  let previewContent = "";
+  if (hasSvg && recolourHex) {{
+    const rc = _applyRecolour(_getActiveSvgMarkup(b), recolourHex);
+    previewContent = `<img src="data:image/png;base64,${{getActiveLogo(b)}}" style="display:none"><div class="svg-overlay" style="display:flex">${{rc}}</div>`;
+  }} else {{
+    previewContent = `<img src="data:image/png;base64,${{getActiveLogo(b)}}"><div class="svg-overlay" style="display:none"></div>`;
+  }}
+
+  // Logo candidates picker
+  let logoPicker = "";
+  if (b.logo_candidates && b.logo_candidates.length > 0) {{
+    const selIdx = selectedLogos[b.folder] !== undefined ? selectedLogos[b.folder] : b.logo_candidates.findIndex(c => c.is_selected);
+    logoPicker = `<h4 style="font-size:12px;color:#666;margin-bottom:8px;">Logo options (${{b.logo_candidates.length}})</h4><div class="logo-picker">`;
+    b.logo_candidates.forEach((c, i) => {{
+      const sel = i === selIdx ? "selected" : "";
+      const svgBadge = c.is_svg ? ' <span class="badge badge-svg" style="font-size:8px;">SVG</span>' : "";
+      logoPicker += `<div class="logo-option ${{sel}}" onclick="selectLogo('${{b.folder}}',${{i}})">
+        <img src="data:image/png;base64,${{c.thumb_b64}}" alt="Option ${{i+1}}">
+        <div class="lo-label">T${{c.tier}}: ${{c.tier_name}}${{svgBadge}}</div>
+        <div class="lo-source">${{c.size}} | ${{Math.round(c.confidence*100)}}%</div>
+        <div class="lo-source" style="word-break:break-all;">${{c.url ? c.url.substring(0,60) : ""}}</div>
+      </div>`;
+    }});
+    logoPicker += "</div>";
+  }} else {{
+    logoPicker = `<p style="font-size:11px;color:#999;">Single logo found (run with --multi for options)</p>`;
+  }}
+
+  // Recolour section
+  let recolourSection = "";
+  if (hasSvg) {{
+    recolourSection = `<div class="recolour-section">
+      <h4>Recolour SVG logo</h4>
+      <div class="recolour-controls">
+        <input type="color" value="${{recolourHex || '#FFFFFF'}}" onchange="recolourSVG('${{b.folder}}',this.value)">
+        <button onclick="recolourSVG('${{b.folder}}','#FFFFFF')">White</button>
+        <button onclick="recolourSVG('${{b.folder}}','#000000')">Black</button>
+        <button onclick="resetLogoColour('${{b.folder}}')">Reset</button>
+      </div>
+    </div>`;
+  }}
+
+  // Colour swatches
+  let colourHtml = `<div class="colour-section"><h4>Background colour</h4><div class="colour-options">`;
+  const cands = b.colour_candidates || [{{hex:b.colour, source:"auto"}}];
+  for (const c of cands) {{
+    const isAct = c.hex === ac;
+    const bdr = c.hex === "#FFFFFF" ? "border:1px solid #ddd;" : "";
+    colourHtml += `<div class="colour-swatch ${{isAct?"active":""}}" style="background:${{c.hex}};${{bdr}}; width:28px;height:28px;" data-hex="${{c.hex}}" title="${{c.hex}} (${{c.source}})" onclick="switchColour('${{b.folder}}','${{c.hex}}');openDetail('${{b.folder}}')"></div>`;
+  }}
+  colourHtml += `<input type="color" class="colour-input" value="${{ac}}" style="width:28px;height:28px;" onchange="switchColour('${{b.folder}}',this.value);openDetail('${{b.folder}}')" title="Custom colour">`;
+  colourHtml += `</div></div>`;
+
+  const websiteLink = b.website ? `<dd><a href="${{b.website}}" target="_blank" style="color:#1a73e8;">${{b.website}}</a></dd>` : "<dd>N/A</dd>";
+  const isFinal = finalized.has(b.folder);
+  const isFlagged = flagged.has(b.folder);
+
+  document.getElementById("detailPanel").innerHTML = `
+    <div class="detail-header">
+      <h2>${{b.name}}</h2>
+      <span class="category-tag" style="font-size:11px;">${{b.category}}</span>
+      <button class="btn-final ${{isFinal?"done":""}}" style="padding:6px 16px;font-size:12px;" onclick="toggleFinal('${{b.folder}}');openDetail('${{b.folder}}')">${{isFinal?"Finalized":"Mark Final"}}</button>
+      <button class="btn-flag ${{isFlagged?"active":""}}" style="padding:6px 12px;font-size:12px;" onclick="toggleFlag('${{b.folder}}');openDetail('${{b.folder}}')">${{isFlagged?"Unflag":"Flag"}}</button>
+      <button class="close-btn" onclick="closeDetail()">&times;</button>
+    </div>
+    <div class="detail-body">
+      <div class="detail-left">
+        <div class="detail-preview" style="background:${{ac}}">
+          ${{previewContent}}
+        </div>
+        ${{colourHtml}}
+        ${{recolourSection}}
+      </div>
+      <div class="detail-right">
+        <div class="detail-info">
+          <dt>Website</dt>
+          ${{websiteLink}}
+          <dt>Source</dt>
+          <dd>Tier ${{b.tier}} (${{b.source}}) &mdash; ${{Math.round(b.confidence*100)}}% confidence</dd>
+          <dt>Size</dt>
+          <dd>${{b.original_size}}${{b.undersize?" (upscaled)":""}}</dd>
+          <dt>Background colour</dt>
+          <dd><span style="display:inline-block;width:14px;height:14px;border-radius:3px;background:${{ac}};vertical-align:middle;border:1px solid #ddd;"></span> ${{ac}}</dd>
+          ${{b.meta_description ? `<dt>Description</dt><dd style="font-size:11px;color:#666;">${{b.meta_description}}</dd>` : ""}}
+          ${{b.logo_issues && b.logo_issues.length ? `<dt>Logo issues</dt><dd style="color:#c62828;font-size:11px;">${{b.logo_issues.join(", ")}}</dd>` : ""}}
+        </div>
+        ${{logoPicker}}
+      </div>
+    </div>`;
+
+  document.getElementById("detailOverlay").classList.add("open");
+}}
+
+function closeDetail() {{
+  document.getElementById("detailOverlay").classList.remove("open");
+}}
+
+document.addEventListener("keydown", e => {{ if (e.key === "Escape") closeDetail(); }});
+
+// ─── FILTERS & SORTING ───
 function applyFilters(brands) {{
   if (activeFilter === "finalized") brands = brands.filter(b => finalized.has(b.folder));
   else if (activeFilter === "pending") brands = brands.filter(b => !finalized.has(b.folder));
@@ -1345,7 +1599,6 @@ function renderGrid() {{
   grid.style.setProperty("--card-w", size + "px");
 
   let brands = applyFilters([...BRANDS]);
-
   if (sort === "confidence") brands.sort((a,b) => a.confidence - b.confidence);
   else if (sort === "risk") {{ const ro = {{"HIGH":0,"MEDIUM":1,"LOW":2,"unknown":3}}; brands.sort((a,b) => (ro[a.blending_risk]||3) - (ro[b.blending_risk]||3)); }}
   else if (sort === "tier") brands.sort((a,b) => (a.tier||9) - (b.tier||9));
@@ -1359,12 +1612,16 @@ function renderGrid() {{
     const shapeClass = shape === "circle" ? "shape-circle" : shape === "card" ? "shape-card" : "";
     const ac = getActiveColour(b);
     const rc = b.blending_risk === "LOW" ? "badge-low" : b.blending_risk === "MEDIUM" ? "badge-medium" : "badge-high";
+    const logoSrc = getActiveLogo(b);
+    const hasSvg = _getActiveSvgMarkup(b).length > 0;
+    const recolourHex = logoRecolours[b.folder];
 
     let badges = `<span class="badge ${{rc}}">${{b.blending_risk}}</span> `;
     if (b.is_svg || b.has_svg_file) badges += `<span class="badge badge-svg">SVG</span> `;
     if (b.bg_removed) badges += `<span class="badge badge-rembg">BG Rem</span> `;
     if (b.undersize) badges += `<span class="badge badge-undersize">Upscaled</span> `;
     if (b.logo_issues && b.logo_issues.length) badges += `<span class="badge badge-logoissue" title="${{b.logo_issues.join(', ')}}">!</span> `;
+    const candCount = (b.logo_candidates && b.logo_candidates.length > 1) ? `<span class="badge" style="background:#f0f0f0;color:#333;">${{b.logo_candidates.length}} opts</span> ` : "";
 
     let swatches = `<span class="label">BG:</span>`;
     const cands = b.colour_candidates || [{{hex:b.colour, source:"auto", blending_risk:b.blending_risk}}];
@@ -1372,48 +1629,37 @@ function renderGrid() {{
       const isAct = c.hex === ac;
       const rd = c.blending_risk === "LOW" ? "r-low" : c.blending_risk === "MEDIUM" ? "r-medium" : c.blending_risk === "HIGH" ? "r-high" : "";
       const bdr = c.hex === "#FFFFFF" ? "border:1px solid #ddd;" : "";
-      swatches += `<div class="colour-swatch ${{isAct?"active":""}}" style="background:${{c.hex}};${{bdr}}" data-hex="${{c.hex}}" title="${{c.hex}} (${{c.source}})" onclick="switchColour('${{b.folder}}','${{c.hex}}')">${{rd?`<span class="risk-dot ${{rd}}"></span>`:""}}</div>`;
+      swatches += `<div class="colour-swatch ${{isAct?"active":""}}" style="background:${{c.hex}};${{bdr}}" data-hex="${{c.hex}}" title="${{c.hex}} (${{c.source}})" onclick="switchColour('${{b.folder}}','${{c.hex}}',event)">${{rd?`<span class="risk-dot ${{rd}}"></span>`:""}}</div>`;
     }}
-    swatches += `<input type="color" class="colour-input" value="${{ac}}" onchange="customColour('${{b.folder}}',this)" title="Custom colour">`;
+    swatches += `<input type="color" class="colour-input" value="${{ac}}" onchange="customColour('${{b.folder}}',this,event)" onclick="event.stopPropagation()" title="Custom colour">`;
 
-    const desc = b.meta_description ? `<div class="description">${{b.meta_description}}</div>` : "";
-    const websiteLink = b.website ? `<a class="website-link" href="${{b.website}}" target="_blank" rel="noopener">${{b.website.replace(/^https?:\\/\\//, "")}}</a>` : "";
-    const hasSvgMarkup = b.svg_markup && b.svg_markup.length > 0;
-    const recolourBtn = hasSvgMarkup ? `<button class="btn-recolour" onclick="toggleRecolourRow('${{b.folder}}')">Recolour Logo</button>` : "";
-    const currentRecolour = logoRecolours[b.folder] || "#FFFFFF";
-    const recolourRow = hasSvgMarkup ? `<div class="recolour-row"><label>Logo colour:</label><input type="color" class="recolour-input" value="${{currentRecolour}}" onchange="recolourSVG('${{b.folder}}',this.value)"><button style="font-size:9px;padding:2px 6px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer;" onclick="resetLogoColour('${{b.folder}}')">Reset</button></div>` : "";
-    // If SVG was recoloured, show the recoloured SVG overlay
-    const svgOverlayContent = (hasSvgMarkup && logoRecolours[b.folder]) ? (() => {{
-      let sv = b.svg_markup;
-      const rh = logoRecolours[b.folder];
-      sv = sv.replace(/fill="(?!none|url)([^"]*)"/gi, `fill="${{rh}}"`);
-      sv = sv.replace(/stroke="(?!none|url)([^"]*)"/gi, `stroke="${{rh}}"`);
-      sv = sv.replace(/fill:\\s*(?!none|url)[^;"]+/gi, `fill:${{rh}}`);
-      sv = sv.replace(/stroke:\\s*(?!none|url)[^;"]+/gi, `stroke:${{rh}}`);
-      return sv;
-    }})() : "";
-    const imgDisplay = svgOverlayContent ? "none" : "";
-    const svgDisplay = svgOverlayContent ? "flex" : "none";
+    // Preview: show recoloured SVG or PNG
+    let previewImg = "";
+    if (hasSvg && recolourHex) {{
+      const rcSvg = _applyRecolour(_getActiveSvgMarkup(b), recolourHex);
+      previewImg = `<img src="data:image/png;base64,${{logoSrc}}" style="display:none"><div class="svg-overlay" style="display:flex">${{rcSvg}}</div>`;
+    }} else {{
+      previewImg = `<img src="data:image/png;base64,${{logoSrc}}" alt="${{b.name}}" loading="lazy"><div class="svg-overlay" style="display:none"></div>`;
+    }}
+
+    const websiteLink = b.website ? `<a class="website-link" href="${{b.website}}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${{b.website.replace(/^https?:\\/\\//, "").replace(/\\/$/,"")}}</a>` : "";
 
     html += `
-      <div class="card ${{isFinal?"finalized":""}} ${{isFlagged?"flagged":""}}" data-folder="${{b.folder}}">
+      <div class="card ${{isFinal?"finalized":""}} ${{isFlagged?"flagged":""}}" data-folder="${{b.folder}}" onclick="openDetail('${{b.folder}}')">
         <div class="card-preview ${{shapeClass}}" style="background:${{ac}}">
-          <img src="data:image/png;base64,${{b.logo_b64}}" alt="${{b.name}}" loading="lazy" style="${{imgDisplay ? "display:none" : ""}}">
-          <div class="svg-overlay" style="display:${{svgDisplay}}">${{svgOverlayContent}}</div>
+          ${{previewImg}}
+          <span class="expand-hint">Click to expand</span>
         </div>
         <div class="card-meta">
           <div class="brand-name">${{b.name}}</div>
           ${{websiteLink}}
           <span class="category-tag">${{b.category}}</span>
           <div class="meta-row"><span class="hex-display">${{ac}}</span><span>T${{b.tier}} ${{Math.round(b.confidence*100)}}%</span></div>
-          <div style="margin-top:3px">${{badges}}</div>
-          ${{desc}}
+          <div style="margin-top:3px">${{badges}}${{candCount}}</div>
           <div class="colour-options">${{swatches}}</div>
-          ${{recolourRow}}
           <div class="card-actions">
-            <button class="btn-final ${{isFinal?"done":""}}" onclick="toggleFinal('${{b.folder}}')">${{isFinal?"Finalized":"Mark Final"}}</button>
-            <button class="btn-flag ${{isFlagged?"active":""}}" onclick="toggleFlag('${{b.folder}}')">${{isFlagged?"Unflag":"Flag"}}</button>
-            ${{recolourBtn}}
+            <button class="btn-final ${{isFinal?"done":""}}" onclick="toggleFinal('${{b.folder}}',event)">${{isFinal?"Finalized":"Mark Final"}}</button>
+            <button class="btn-flag ${{isFlagged?"active":""}}" onclick="toggleFlag('${{b.folder}}',event)">${{isFlagged?"Unflag":"Flag"}}</button>
           </div>
         </div>
       </div>`;
@@ -1427,61 +1673,79 @@ function renderGrid() {{
   document.getElementById("progressFill").style.width = `${{Math.round(finalCount/BRANDS.length*100)}}%`;
 }}
 
-function exportFinal() {{
-  const data = BRANDS.filter(b => finalized.has(b.folder)).map(b => ({{
-    brand_name: b.name,
-    folder: b.folder,
-    category: b.category,
-    website: b.website || "",
-    bg_colour: selectedColours[b.folder] || b.colour,
-    logo_recolour: logoRecolours[b.folder] || null,
-    meta_description: b.meta_description || "",
-    logo_file: b.folder + "/logo.png",
-    svg_file: b.has_svg_file ? b.folder + "/logo.svg" : null,
-    is_svg: b.is_svg,
-    source_tier: b.tier,
-    logo_source: b.source,
-    confidence: b.confidence,
-    blending_risk: b.blending_risk,
-    logo_quality_score: b.logo_quality_score,
-    logo_issues: b.logo_issues || [],
-    original_size: b.original_size,
-    undersize: b.undersize,
-    bg_removed: b.bg_removed,
-  }}));
+// ─── EXPORTS ───
+function _buildExportData() {{
+  return BRANDS.filter(b => finalized.has(b.folder)).map(b => {{
+    const selCand = selectedLogos[b.folder] !== undefined ? b.logo_candidates[selectedLogos[b.folder]] : null;
+    return {{
+      brand_name: b.name, folder: b.folder, category: b.category,
+      website: b.website || "",
+      bg_colour: selectedColours[b.folder] || b.colour,
+      logo_recolour: logoRecolours[b.folder] || null,
+      meta_description: b.meta_description || "",
+      logo_file: b.folder + "/logo.png",
+      svg_file: b.has_svg_file ? b.folder + "/logo.svg" : null,
+      is_svg: b.is_svg,
+      selected_logo_source: selCand ? selCand.source : b.source,
+      selected_logo_tier: selCand ? selCand.tier : b.tier,
+      source_tier: b.tier, logo_source: b.source,
+      confidence: b.confidence, blending_risk: b.blending_risk,
+      logo_quality_score: b.logo_quality_score,
+      logo_issues: b.logo_issues || [],
+      original_size: b.original_size, undersize: b.undersize, bg_removed: b.bg_removed,
+    }};
+  }});
+}}
+
+function exportJSON() {{
+  const data = _buildExportData();
+  if (!data.length) {{ document.getElementById("exportStatus").textContent = "No finalized brands"; return; }}
   const blob = new Blob([JSON.stringify(data, null, 2)], {{type: "application/json"}});
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-  a.download = "approved_brands.json"; a.click();
-  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands`;
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "approved_brands.json"; a.click();
+  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (JSON)`;
 }}
 
 function exportCSV() {{
-  const data = BRANDS.filter(b => finalized.has(b.folder)).map(b => ({{
-    brand_name: b.name,
-    category: b.category,
-    website: b.website || "",
-    bg_colour: selectedColours[b.folder] || b.colour,
-    logo_recolour: logoRecolours[b.folder] || "",
-    meta_description: b.meta_description || "",
-    logo_file: b.folder + "/logo.png",
-    svg_file: b.has_svg_file ? b.folder + "/logo.svg" : "",
-    is_svg: b.is_svg,
-    source_tier: b.tier,
-    logo_source: b.source,
-    confidence: b.confidence,
-    blending_risk: b.blending_risk,
-    logo_quality_score: b.logo_quality_score,
-    original_size: b.original_size,
-  }}));
-  if (!data.length) {{ document.getElementById("exportStatus").textContent = "No finalized brands to export"; return; }}
-  const headers = Object.keys(data[0]);
-  const csv = [headers.join(","), ...data.map(r => headers.map(h => `"${{String(r[h]||"").replace(/"/g,'""')}}"`).join(","))].join("\\n");
+  const data = _buildExportData();
+  if (!data.length) {{ document.getElementById("exportStatus").textContent = "No finalized brands"; return; }}
+  const flat = data.map(d => ({{ ...d, logo_issues: (d.logo_issues||[]).join("; "), logo_recolour: d.logo_recolour||"" }}));
+  const headers = Object.keys(flat[0]);
+  const csv = [headers.join(","), ...flat.map(r => headers.map(h => `"${{String(r[h]||"").replace(/"/g,'""')}}"`).join(","))].join("\\n");
   const blob = new Blob([csv], {{type:"text/csv"}});
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-  a.download = "approved_brands.csv"; a.click();
-  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands as CSV`;
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "approved_brands.csv"; a.click();
+  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (CSV)`;
 }}
 
+async function exportZIP() {{
+  const data = _buildExportData();
+  if (!data.length) {{ document.getElementById("exportStatus").textContent = "No finalized brands"; return; }}
+  document.getElementById("exportStatus").textContent = "Building ZIP...";
+  const zip = new JSZip();
+
+  // Add data CSV
+  const flat = data.map(d => ({{ ...d, logo_issues: (d.logo_issues||[]).join("; "), logo_recolour: d.logo_recolour||"" }}));
+  const headers = Object.keys(flat[0]);
+  const csvStr = [headers.join(","), ...flat.map(r => headers.map(h => `"${{String(r[h]||"").replace(/"/g,'""')}}"`).join(","))].join("\\n");
+  zip.file("brand_data.csv", csvStr);
+  zip.file("brand_data.json", JSON.stringify(data, null, 2));
+
+  // Add logo PNGs (from base64 data already in page)
+  for (const b of BRANDS) {{
+    if (!finalized.has(b.folder)) continue;
+    const logoSrc = getActiveLogo(b);
+    if (logoSrc) {{
+      // Clean brand name for folder
+      const safeName = b.name.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\\s+/g, "_");
+      zip.file(`logos/${{safeName}}.png`, logoSrc, {{base64: true}});
+    }}
+  }}
+
+  const content = await zip.generateAsync({{type:"blob"}});
+  const a = document.createElement("a"); a.href = URL.createObjectURL(content); a.download = "approved_brand_assets.zip"; a.click();
+  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (ZIP with logos + data)`;
+}}
+
+// ─── EVENT LISTENERS ───
 document.getElementById("shapeSelect").addEventListener("change", renderGrid);
 document.getElementById("sizeSlider").addEventListener("input", renderGrid);
 document.getElementById("sortSelect").addEventListener("change", renderGrid);
@@ -1541,67 +1805,73 @@ def process_brand(brand_name: str, website: str,
         "errors": [],
     }
 
-    # ── TIER 0: Use pre-existing logo URL from CSV ───────────────────────────
+    # ── Logo sourcing tiers ────────────────────────────────────────────────────
+    tier_funcs = [
+        (0, "CSV provided",  lambda: None),  # placeholder, handled below
+        (1, "Brandfetch",    lambda: tier1_brandfetch(brand_name, website)),
+        (2, "Website scrape",lambda: tier2_website_scrape(website)),
+        (3, "Wikimedia",     lambda: tier3_wikimedia(brand_name)),
+        (4, "Favicon",       lambda: tier4_google_favicon(website)),
+        (5, "DuckDuckGo",    lambda: tier5_duckduckgo(brand_name)),
+        (6, "Gilbarbara",    lambda: tier6_gilbarbara(brand_name)),
+        (7, "Seeklogo",      lambda: tier7_seeklogo(brand_name)),
+        (8, "Simple Icons",  lambda: tier8_simple_icons(brand_name)),
+    ]
+
     logo_data = None
+    logo_candidates = []  # list of {tier, tier_name, image, source, url, is_svg, svg_data, confidence}
+    theme_color = None
+
+    # ── TIER 0: Use pre-existing logo URL from CSV ───────────────────────────
     if existing_logo_url:
         img, is_svg, svg_raw = _fetch_image(existing_logo_url)
         if img:
-            logo_data = {
+            cand = {
+                "tier": 0, "tier_name": "CSV provided",
                 "source": "csv:provided",
                 "image": img, "is_svg": is_svg,
                 "url": existing_logo_url, "confidence": 0.95,
             }
             if svg_raw:
-                logo_data["svg_data"] = svg_raw
-            result["source_tier"] = 0
+                cand["svg_data"] = svg_raw
+            logo_candidates.append(cand)
+            if not MULTI_CANDIDATES:
+                logo_data = cand
+                result["source_tier"] = 0
 
-    # ── TIER 1: Brandfetch (domain CDN + search) ─────────────────────────────
-    if not logo_data:
-        logo_data = tier1_brandfetch(brand_name, website)
-        if logo_data:
-            result["source_tier"] = 1
-
-    # ── TIER 2: Website scraping ──────────────────────────────────────────────
-    theme_color = None
-    if not logo_data:
-        logo_data = tier2_website_scrape(website)
-        if logo_data:
-            result["source_tier"] = 2
-            theme_color = logo_data.get("theme_color")
-
-    # ── TIER 3: Wikimedia Commons + Wikipedia ────────────────────────────────
-    if not logo_data:
-        logo_data = tier3_wikimedia(brand_name)
-        if logo_data:
-            result["source_tier"] = 3
-
-    # ── TIER 4: Google Favicon ────────────────────────────────────────────────
-    if not logo_data:
-        logo_data = tier4_google_favicon(website)
-        if logo_data:
-            result["source_tier"] = 4
-
-    # ── TIER 5: DuckDuckGo ────────────────────────────────────────────────────
-    if not logo_data:
-        logo_data = tier5_duckduckgo(brand_name)
-        if logo_data:
-            result["source_tier"] = 5
-
-    # ── TIER 6: Gilbarbara SVG repo ───────────────────────────────────────────
-    if not logo_data:
-        logo_data = tier6_gilbarbara(brand_name)
-        if logo_data:
-            result["source_tier"] = 6
-
-    # ── TIER 7: Simple Icons ─────────────────────────────────────────────────
-    if not logo_data:
-        logo_data = tier7_simple_icons(brand_name)
-        if logo_data:
-            result["source_tier"] = 7
+    # ── TIERS 1-8 ────────────────────────────────────────────────────────────
+    for tier_num, tier_name, tier_fn in tier_funcs[1:]:
+        if not MULTI_CANDIDATES and logo_data:
+            break  # already found one, stop (classic mode)
+        if len(logo_candidates) >= 5 and MULTI_CANDIDATES:
+            break  # enough candidates
+        try:
+            td = tier_fn()
+        except Exception:
+            td = None
+        if td:
+            cand = {
+                "tier": tier_num, "tier_name": tier_name,
+                "source": td.get("source", tier_name),
+                "image": td["image"], "is_svg": td.get("is_svg", False),
+                "url": td.get("url"), "confidence": td.get("confidence", 0.5),
+            }
+            if td.get("svg_data"):
+                cand["svg_data"] = td["svg_data"]
+            if td.get("theme_color"):
+                theme_color = td["theme_color"]
+            if td.get("si_colour"):
+                cand["si_colour"] = td["si_colour"]
+            logo_candidates.append(cand)
+            if not logo_data:
+                logo_data = cand
+                result["source_tier"] = tier_num
 
     if not logo_data:
         result["errors"].append("No logo found in any tier")
         return result
+
+    result["logo_candidates_count"] = len(logo_candidates)
 
     # ── Record source info ───────────────────────────────────────────────────
     raw_img = logo_data["image"]
@@ -1693,6 +1963,45 @@ def process_brand(brand_name: str, website: str,
     if logo_data.get("svg_data"):
         (brand_dir / "logo.svg").write_bytes(logo_data["svg_data"])
 
+    # Save logo candidates (for multi-candidate mode)
+    saved_candidates = []
+    for idx, cand in enumerate(logo_candidates):
+        cand_info = {
+            "index": idx,
+            "tier": cand["tier"],
+            "tier_name": cand["tier_name"],
+            "source": cand["source"],
+            "url": cand.get("url", ""),
+            "is_svg": cand.get("is_svg", False),
+            "confidence": cand.get("confidence", 0.5),
+            "size": f"{cand['image'].width}x{cand['image'].height}",
+            "is_selected": (cand is logo_data),
+        }
+        # Save candidate thumbnail as base64 in meta (for HTML)
+        try:
+            thumb = cand["image"].copy()
+            thumb.thumbnail((200, 200), Image.LANCZOS)
+            if thumb.mode != "RGBA":
+                thumb = thumb.convert("RGBA")
+            buf = BytesIO()
+            thumb.save(buf, format="PNG")
+            cand_info["thumb_b64"] = base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            cand_info["thumb_b64"] = ""
+        # Save candidate SVG data if present
+        if cand.get("svg_data"):
+            try:
+                raw_svg = cand["svg_data"]
+                if isinstance(raw_svg, bytes):
+                    raw_svg = raw_svg.decode("utf-8", errors="replace")
+                if "<svg" in raw_svg.lower() and len(raw_svg) < 200_000:
+                    cand_info["svg_markup"] = raw_svg
+            except Exception:
+                pass
+        saved_candidates.append(cand_info)
+
+    result["logo_candidates"] = saved_candidates
+
     with open(brand_dir / "meta.json", "w") as f:
         json.dump({k: v for k, v in result.items() if k != "image"}, f, indent=2, cls=SafeEncoder)
 
@@ -1700,7 +2009,7 @@ def process_brand(brand_name: str, website: str,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Brand Asset Pipeline PoC v2")
+    parser = argparse.ArgumentParser(description="Brand Asset Pipeline v4")
     parser.add_argument("--input", required=True, help="Input CSV file")
     parser.add_argument("--sample", type=int, default=0, help="Number of brands to sample (0=all)")
     parser.add_argument("--output", default="./brand_assets", help="Output directory")
@@ -1709,13 +2018,18 @@ def main():
                         help="Background removal model (default: u2net)")
     parser.add_argument("--alpha-matting", action="store_true",
                         help="Enable alpha matting for cleaner edges (slower)")
+    parser.add_argument("--multi", action="store_true",
+                        help="Collect up to 5 logo candidates per brand from multiple tiers (slower, but offers choices)")
+    parser.add_argument("--threads", type=int, default=1,
+                        help="Number of parallel threads (default: 1, recommended: 4)")
     args = parser.parse_args()
 
-    global OUT_DIR, REMBG_MODEL, ALPHA_MATTING
+    global OUT_DIR, REMBG_MODEL, ALPHA_MATTING, MULTI_CANDIDATES
     OUT_DIR = Path(args.output)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     REMBG_MODEL = args.rembg_model
     ALPHA_MATTING = args.alpha_matting
+    MULTI_CANDIDATES = args.multi
 
     # Read CSV
     with open(args.input) as f:
@@ -1727,11 +2041,15 @@ def main():
         rows = random.sample(rows, args.sample)
 
     print(f"\n{'='*60}")
-    print(f"  Brand Asset Pipeline v2 — Processing {len(rows)} brands")
+    print(f"  Brand Asset Pipeline v4 — Processing {len(rows)} brands")
     print(f"  Output:  {OUT_DIR.absolute()}")
     print(f"  Model:   {REMBG_MODEL}  |  Alpha matting: {'ON' if ALPHA_MATTING else 'OFF'}")
     svg_status = "\u2705 cairosvg installed" if HAS_CAIROSVG else "\u26a0\ufe0f  cairosvg NOT installed — SVGs will be saved but not rasterized"
     print(f"  SVG:     {svg_status}")
+    multi_str = f"  Multi:   ON (up to 5 candidates per brand)" if MULTI_CANDIDATES else "  Multi:   OFF (first match wins)"
+    print(multi_str)
+    if args.threads > 1:
+        print(f"  Threads: {args.threads}")
     print(f"{'='*60}\n")
     if not HAS_CAIROSVG:
         print("  TIP: Install cairosvg for SVG support:  brew install cairo && pip install cairosvg\n")
@@ -1749,60 +2067,98 @@ def main():
         col_color = next((c for c in cols if c.lower() in ("color", "colour", "brand_colour", "hex")), "")
         print(f"  CSV columns: name={col_name}, site={col_site or 'N/A'}, logo={col_logo or 'N/A'}, color={col_color or 'N/A'}\n")
 
+    # Build work items
+    work_items = []
     for i, row in enumerate(rows):
         name = row.get(col_name, "").strip()
         site = row.get(col_site, "").strip() if col_site else ""
         existing_logo_url = row.get(col_logo, "").strip() if col_logo else ""
         existing_color = row.get(col_color, "").strip() if col_color else ""
-        if not name:
-            continue
+        if name:
+            work_items.append((i, name, site, existing_logo_url, existing_color))
 
-        print(f"[{i+1:3d}/{len(rows)}] {name:35s} ", end="", flush=True)
+    import threading
+    print_lock = threading.Lock()
+    completed = [0]
 
-        result = process_brand(name, site, existing_logo_url, existing_color)
-        results.append(result)
+    def _process_one(item):
+        idx, name, site, logo_url, color = item
+        result = process_brand(name, site, logo_url, color)
+        with print_lock:
+            completed[0] += 1
+            n = completed[0]
+            if result["status"] == "success":
+                risk = result.get("blending_risk", "")
+                emoji = "\u2705" if risk == "LOW" else ("\u26a0\ufe0f " if risk == "MEDIUM" else "\U0001f534")
+                svg_tag = " [SVG]" if result.get("is_svg") else ""
+                size_tag = " [UNDERSIZE]" if result.get("undersize") else ""
+                cands_tag = f" [{result.get('logo_candidates_count', 1)} opts]" if MULTI_CANDIDATES else ""
+                print(f"[{n:3d}/{len(work_items)}] {name:35s} {emoji}  T{result['source_tier']}  {result['brand_colour']}  conf={result['confidence']}{svg_tag}{size_tag}{cands_tag}")
+            else:
+                print(f"[{n:3d}/{len(work_items)}] {name:35s} \u274c  {result['errors'][:1]}")
+        return result
 
+    if args.threads > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as pool:
+            results = list(pool.map(_process_one, work_items))
+    else:
+        results = []
+        for item in work_items:
+            results.append(_process_one(item))
+            time.sleep(0.2)
+
+    for result in results:
         status_counts[result["status"]] += 1
-        if result["source_tier"]:
+        if result.get("source_tier") is not None:
             tier_counts[f"tier{result['source_tier']}"] += 1
 
-        if result["status"] == "success":
-            risk = result.get("blending_risk", "")
-            emoji = "\u2705" if risk == "LOW" else ("\u26a0\ufe0f " if risk == "MEDIUM" else "\U0001f534")
-            svg_tag = " [SVG]" if result.get("is_svg") else ""
-            size_tag = " [UNDERSIZE]" if result.get("undersize") else ""
-            print(f"{emoji}  T{result['source_tier']}  {result['brand_colour']}  conf={result['confidence']}{svg_tag}{size_tag}")
-        else:
-            print(f"\u274c  {result['errors'][:1]}")
-
-        time.sleep(0.3)
-
     # ── Summary ──────────────────────────────────────────────────────────────
+    tier_names = {
+        0: "CSV provided", 1: "Brandfetch", 2: "Website scrape",
+        3: "Wikimedia", 4: "Favicon", 5: "DuckDuckGo",
+        6: "Gilbarbara", 7: "Seeklogo", 8: "Simple Icons",
+    }
     print(f"\n{'='*60}")
     print(f"  RESULTS SUMMARY")
     print(f"{'='*60}")
     print(f"  Total:      {len(results)}")
     print(f"  Success:    {status_counts.get('success', 0)}")
     print(f"  Failed:     {status_counts.get('failed', 0)}")
-    print(f"  Tier 0 (CSV provided):  {tier_counts.get('tier0', 0)}")
-    print(f"  Tier 1 (Brandfetch):    {tier_counts.get('tier1', 0)}")
-    print(f"  Tier 2 (Website):       {tier_counts.get('tier2', 0)}")
-    print(f"  Tier 3 (Wikimedia):     {tier_counts.get('tier3', 0)}")
-    print(f"  Tier 4 (Favicon):       {tier_counts.get('tier4', 0)}")
-    print(f"  Tier 5 (DuckDuckGo):    {tier_counts.get('tier5', 0)}")
-    print(f"  Tier 6 (Gilbarbara):    {tier_counts.get('tier6', 0)}")
-    print(f"  Tier 7 (Simple Icons):  {tier_counts.get('tier7', 0)}")
+
+    print(f"\n  Source effectiveness:")
+    print(f"  {'Tier':<6} {'Source':<18} {'Hits':>5}  {'Bar':<20} {'Status'}")
+    print(f"  {'-'*70}")
+    for t in range(9):
+        count = tier_counts.get(f"tier{t}", 0)
+        name = tier_names.get(t, f"Tier {t}")
+        bar = "\u2588" * min(count, 40)
+        if count == 0:
+            status = "\u274c  ZERO HITS — consider removing"
+        elif count < 3:
+            status = "\u26a0\ufe0f  low yield"
+        else:
+            status = "\u2705"
+        print(f"  T{t:<5} {name:<18} {count:>5}  {bar:<20} {status}")
 
     svg_count = sum(1 for r in results if r.get("is_svg"))
     undersize_count = sum(1 for r in results if r.get("undersize"))
     bg_removed = sum(1 for r in results if r.get("bg_removed"))
     high_risk = [r for r in results if r.get("blending_risk") == "HIGH"]
+    logo_issues = [r for r in results if r.get("logo_issues")]
 
     print(f"\n  Quality indicators:")
     print(f"    SVG logos found:      {svg_count}")
     print(f"    Undersize (<500px):   {undersize_count}")
     print(f"    BG removed (rembg):   {bg_removed}")
     print(f"    High blending risk:   {len(high_risk)}")
+    print(f"    Logo issues flagged:  {len(logo_issues)}")
+
+    # Category breakdown
+    cat_counts = Counter(r.get("category", "Uncategorized") for r in results if r["status"] == "success")
+    if cat_counts:
+        print(f"\n  Category breakdown:")
+        for cat, cnt in cat_counts.most_common():
+            print(f"    {cat:<24} {cnt}")
 
     if high_risk:
         print(f"\n  Brands with HIGH blending risk:")
