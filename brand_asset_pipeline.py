@@ -56,6 +56,13 @@ try:
 except ImportError:
     HAS_CAIROSVG = False
 
+# Check playwright availability once at startup
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
 # ─── GLOBAL CONFIG (set by CLI args in main()) ────────────────────────────────
 OUT_DIR = Path("./brand_assets")
 REMBG_MODEL = "u2net"
@@ -83,7 +90,16 @@ class SafeEncoder(json.JSONEncoder):
 TIMEOUT = 15
 MIN_LOGO_SIZE = 200       # reject raster images smaller than this during sourcing
 TARGET_SIZE = 500         # output logo size (minimum guaranteed)
-HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) BrandAssetBot/1.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+# Extra headers specifically for image fetches (Shopify CDN etc.)
+IMAGE_HEADERS = {
+    **HEADERS,
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+}
 OUT_DIR = Path("./brand_assets")
 REMBG_MODEL = "u2net"
 ALPHA_MATTING = False
@@ -108,16 +124,22 @@ def _is_svg_url(url: str) -> bool:
 def _fetch_svg(url: str) -> bytes | None:
     """Download SVG content and validate it."""
     try:
+        # Fix protocol-relative URLs
+        if url.startswith("//"):
+            url = "https:" + url
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code != 200:
+            print(f"  [svg] HTTP {resp.status_code} fetching {url[:80]}", flush=True)
             return None
         content = resp.content
         # Basic SVG validation
         text = content.decode("utf-8", errors="ignore")[:2000]
         if "<svg" in text.lower():
             return content
+        print(f"  [svg] No <svg> tag in response from {url[:80]}", flush=True)
         return None
-    except:
+    except Exception as e:
+        print(f"  [svg] Exception fetching {url[:80]}: {e}", flush=True)
         return None
 
 
@@ -133,11 +155,22 @@ def _svg_to_pil(svg_bytes: bytes, size: int = 500) -> Image.Image | None:
         return None
 
 
-def _fetch_image(url: str) -> tuple[Image.Image | None, bool, bytes | None]:
+def _fetch_image(url: str, referer: str = "") -> tuple[Image.Image | None, bool, bytes | None]:
     """
     Download an image URL. Returns (PIL Image, is_svg, svg_raw_bytes).
     svg_raw_bytes is set even if rasterization failed, so we can still save the SVG.
+    referer: optional Referer header (e.g. brand website) to help with CDN access.
     """
+    # Fix protocol-relative URLs (//cdn.shopify.com/... → https://...)
+    if url.startswith("//"):
+        url = "https:" + url
+
+    # Build image-specific headers with optional Referer
+    hdrs = {**IMAGE_HEADERS}
+    if referer:
+        hdrs["Referer"] = referer
+        hdrs["Origin"] = urlparse(referer).scheme + "://" + urlparse(referer).netloc
+
     # SVG handling
     svg_data = None
     if _is_svg_url(url):
@@ -150,9 +183,14 @@ def _fetch_image(url: str) -> tuple[Image.Image | None, bool, bytes | None]:
             # (some .svg URLs actually return raster fallbacks)
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True)
+        resp = requests.get(url, headers=hdrs, timeout=TIMEOUT, stream=True)
         if resp.status_code != 200:
-            return None, False, svg_data
+            print(f"  [fetch] HTTP {resp.status_code} for {url[:80]}", flush=True)
+            # Retry once with plain HEADERS if image headers failed
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True)
+            if resp.status_code != 200:
+                print(f"  [fetch] Retry also failed: HTTP {resp.status_code}", flush=True)
+                return None, False, svg_data
         ct = resp.headers.get("Content-Type", "")
         # Check if response is SVG
         if "svg" in ct:
@@ -163,12 +201,15 @@ def _fetch_image(url: str) -> tuple[Image.Image | None, bool, bytes | None]:
             # Have SVG data but can't rasterize — return None image but keep svg_data
             return None, True, svg_data
         if "image" not in ct and "octet" not in ct:
+            print(f"  [fetch] Unexpected content-type '{ct}' for {url[:80]}", flush=True)
             return None, False, svg_data
         img = Image.open(BytesIO(resp.content))
         if img.width < MIN_LOGO_SIZE or img.height < MIN_LOGO_SIZE:
+            print(f"  [fetch] Image too small ({img.width}x{img.height}) from {url[:80]}", flush=True)
             return None, False, svg_data
         return img, False, svg_data
-    except:
+    except Exception as e:
+        print(f"  [fetch] Exception fetching {url[:80]}: {e}", flush=True)
         return None, False, svg_data
 
 
@@ -307,6 +348,43 @@ def tier2_website_scrape(website_url: str) -> dict | None:
             if any("logo" in x.lower() for x in [src, alt, cls]):
                 candidates.append(("svg-img", urljoin(base, src), 0.93))
 
+    # Priority 0.5: Inline <svg> elements in header/nav/logo containers
+    _logo_containers = soup.find_all(
+        lambda tag: tag.name in ("header", "nav", "a", "div", "span")
+        and any("logo" in (v if isinstance(v, str) else " ".join(v)).lower()
+                for attr in ["class", "id", "aria-label"]
+                for v in [tag.get(attr, "")] if v)
+    )
+    # Also check direct <svg> children of <a> tags with logo-ish hrefs
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag.get("href", "")
+        if href in ("/", website_url) or "home" in href.lower():
+            _logo_containers.append(a_tag)
+    for container in _logo_containers:
+        svg_el = container.find("svg")
+        if svg_el:
+            svg_str = str(svg_el)
+            if len(svg_str) > 100:  # skip trivial/icon SVGs
+                # Ensure the SVG has xmlns for standalone rendering
+                if "xmlns" not in svg_str:
+                    svg_str = svg_str.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+                svg_bytes = svg_str.encode("utf-8")
+                img = _svg_to_pil(svg_bytes, TARGET_SIZE)
+                if img:
+                    result = {
+                        "source": "website:inline-svg",
+                        "image": img, "is_svg": True,
+                        "svg_data": svg_bytes,
+                        "url": website_url,
+                        "confidence": 0.9,
+                        "theme_color": None,
+                    }
+                    # Grab theme-color while we're here
+                    tc = soup.find("meta", attrs={"name": "theme-color"})
+                    if tc and tc.get("content"):
+                        result["theme_color"] = tc["content"].strip()
+                    return result
+
     # Priority 1: apple-touch-icon
     for link in soup.find_all("link", rel=lambda r: r and "apple-touch-icon" in " ".join(r).lower()):
         href = link.get("href")
@@ -352,7 +430,7 @@ def tier2_website_scrape(website_url: str) -> dict | None:
     # Try candidates in priority order
     candidates.sort(key=lambda x: -x[2])
     for source_type, url, confidence in candidates:
-        img, is_svg, svg_raw = _fetch_image(url)
+        img, is_svg, svg_raw = _fetch_image(url, referer=website_url)
         if img:
             result = {
                 "source": f"website:{source_type}",
@@ -366,6 +444,132 @@ def tier2_website_scrape(website_url: str) -> dict | None:
                 result["svg_data"] = svg_raw
             return result
 
+    return None
+
+
+def _is_spa_html(html: str) -> bool:
+    """Detect if HTML looks like a client-side SPA (Next.js, Nuxt, React, etc.)."""
+    soup = BeautifulSoup(html, "html.parser")
+    # SPA indicators: framework root divs with very few <img> tags
+    spa_ids = {"__next", "__nuxt", "app", "root", "__app"}
+    has_spa_root = any(soup.find(id=sid) for sid in spa_ids)
+    img_count = len(soup.find_all("img"))
+    # SPA pages often have <script> tags but few rendered images
+    script_count = len(soup.find_all("script"))
+    return has_spa_root and img_count <= 2 and script_count > 3
+
+
+def tier2b_playwright_scrape(website_url: str) -> dict | None:
+    """
+    Fallback scraper using Playwright for SPA-rendered sites.
+    Only called if tier2 returned None AND the raw HTML looks like a SPA.
+    Requires: pip install playwright && python -m playwright install chromium
+    """
+    if not HAS_PLAYWRIGHT:
+        return None
+    if not website_url:
+        return None
+
+    try:
+        # Quick check: is the raw HTML actually a SPA?
+        resp = requests.get(website_url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        if not _is_spa_html(resp.text):
+            return None  # not a SPA, no need for Playwright
+
+        print(f"  [playwright] SPA detected, rendering {website_url}...", flush=True)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+            )
+            page.goto(website_url, wait_until="networkidle", timeout=20000)
+            html = page.content()
+            browser.close()
+
+        # Now parse the fully-rendered DOM — reuse tier2 logic
+        soup = BeautifulSoup(html, "html.parser")
+        base = website_url
+        candidates = []
+
+        # Inline SVGs in logo containers
+        _logo_containers = soup.find_all(
+            lambda tag: tag.name in ("header", "nav", "a", "div", "span")
+            and any("logo" in (v if isinstance(v, str) else " ".join(v)).lower()
+                    for attr in ["class", "id", "aria-label"]
+                    for v in [tag.get(attr, "")] if v)
+        )
+        for container in _logo_containers:
+            svg_el = container.find("svg")
+            if svg_el and len(str(svg_el)) > 100:
+                svg_str = str(svg_el)
+                if "xmlns" not in svg_str:
+                    svg_str = svg_str.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+                svg_bytes = svg_str.encode("utf-8")
+                img = _svg_to_pil(svg_bytes, TARGET_SIZE)
+                if img:
+                    tc = soup.find("meta", attrs={"name": "theme-color"})
+                    return {
+                        "source": "website:playwright-inline-svg",
+                        "image": img, "is_svg": True, "svg_data": svg_bytes,
+                        "url": website_url, "confidence": 0.88,
+                        "theme_color": tc["content"].strip() if tc and tc.get("content") else None,
+                    }
+
+        # SVG <img> tags
+        for img_tag in soup.find_all("img", src=True):
+            src = img_tag["src"]
+            if _is_svg_url(src):
+                alt = img_tag.get("alt", "")
+                cls = " ".join(img_tag.get("class", []))
+                if any("logo" in x.lower() for x in [src, alt, cls]):
+                    candidates.append(("svg-img", urljoin(base, src), 0.9))
+
+        # <img> with logo in class/alt/src
+        for img_tag in soup.find_all("img"):
+            src = img_tag.get("src", "")
+            alt = img_tag.get("alt", "")
+            cls = " ".join(img_tag.get("class", []))
+            if any("logo" in x.lower() for x in [src, alt, cls]):
+                full_url = urljoin(base, src)
+                if not _is_svg_url(full_url):
+                    candidates.append(("img-logo", full_url, 0.75))
+
+        # apple-touch-icon
+        for link in soup.find_all("link", rel=lambda r: r and "apple-touch-icon" in " ".join(r).lower()):
+            href = link.get("href")
+            if href:
+                candidates.append(("apple-touch-icon", urljoin(base, href), 0.8))
+
+        # og:image
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            candidates.append(("og:image", urljoin(base, og["content"]), 0.55))
+
+        candidates.sort(key=lambda x: -x[2])
+        theme_color = None
+        tc = soup.find("meta", attrs={"name": "theme-color"})
+        if tc and tc.get("content"):
+            theme_color = tc["content"].strip()
+
+        for source_type, url, confidence in candidates:
+            img, is_svg, svg_raw = _fetch_image(url, referer=website_url)
+            if img:
+                result = {
+                    "source": f"website:playwright-{source_type}",
+                    "image": img, "is_svg": is_svg,
+                    "url": url, "confidence": confidence,
+                    "theme_color": theme_color,
+                }
+                if svg_raw:
+                    result["svg_data"] = svg_raw
+                return result
+
+    except Exception as e:
+        print(f"  [playwright] Error: {e}", flush=True)
     return None
 
 
@@ -1086,12 +1290,15 @@ def validate_logo(img: Image.Image, brand_name: str) -> dict:
     score = 1.0
     w, h = img.size
 
-    # Check 1: Aspect ratio — logos are usually roughly square or landscape
-    # Tall/narrow images (like certification badges) are suspicious
+    # Check 1: Aspect ratio — logos can be wide wordmarks (up to ~10:1) or square
+    # Only flag truly extreme ratios (banners, vertical badges)
     aspect = w / max(h, 1)
-    if aspect < 0.3 or aspect > 4.0:
+    if aspect < 0.2 or aspect > 10.0:
         issues.append(f"unusual aspect ratio ({aspect:.1f})")
         score *= 0.5
+    elif aspect > 7.0:
+        issues.append(f"very wide wordmark ({aspect:.1f})")
+        # mild note, no penalty — wide text logos are common
 
     # Check 2: Too many colours = probably a photo, not a logo
     try:
@@ -1259,6 +1466,15 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
   .btn-flag {{ padding:4px 8px; border:1px solid #ff5722; border-radius:6px; background:#fff; color:#ff5722; font-size:10px; cursor:pointer; }}
   .btn-flag:hover {{ background:#fbe9e7; }}
   .btn-flag.active {{ background:#ff5722; color:#fff; }}
+  .flag-menu {{ position:absolute; background:#fff; border:1px solid #ddd; border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,0.15); padding:6px 0; z-index:200; min-width:160px; }}
+  .flag-menu-item {{ padding:8px 14px; font-size:12px; cursor:pointer; display:flex; align-items:center; gap:6px; }}
+  .flag-menu-item:hover {{ background:#f5f5f5; }}
+  .flag-menu-item .flag-dot {{ width:8px; height:8px; border-radius:50%; }}
+  .flag-badge {{ display:inline-block; padding:1px 6px; border-radius:10px; font-size:9px; font-weight:600; }}
+  .flag-badge.wrong-logo {{ background:#ffcdd2; color:#c62828; }}
+  .flag-badge.needs-upscaling {{ background:#fff3e0; color:#e65100; }}
+  .flag-badge.wrong-colour {{ background:#e8eaf6; color:#283593; }}
+  .flag-badge.other {{ background:#f3e5f5; color:#6a1b9a; }}
   .filter-bar {{ padding:6px 24px; background:#fff; border-bottom:1px solid #eee; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }}
   .filter-btn {{ padding:3px 10px; border:1px solid #ddd; border-radius:16px; background:#fff; font-size:11px; cursor:pointer; }}
   .filter-btn:hover {{ background:#f0f0f0; }}
@@ -1333,6 +1549,9 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
   <button class="filter-btn" data-filter="finalized">Finalized</button>
   <button class="filter-btn" data-filter="pending">Pending</button>
   <button class="filter-btn" data-filter="flagged">Flagged</button>
+  <button class="filter-btn" data-filter="flag-wrong-logo" style="font-size:10px;">Wrong Logo</button>
+  <button class="filter-btn" data-filter="flag-needs-upscaling" style="font-size:10px;">Needs Upscaling</button>
+  <button class="filter-btn" data-filter="flag-wrong-colour" style="font-size:10px;">Wrong Colour</button>
   <button class="filter-btn" data-filter="low">Low risk</button>
   <button class="filter-btn" data-filter="high">High risk</button>
   <button class="filter-btn" data-filter="svg">SVG</button>
@@ -1360,7 +1579,7 @@ const FAILED = {failed_json};
 const CATEGORIES = {categories_json};
 
 let finalized = new Set();
-let flagged = new Set();
+let flagged = {{}};  // folder -> reason string (folder -> reason)
 let selectedColours = {{}};
 let selectedLogos = {{}};   // folder -> candidate index
 let logoRecolours = {{}};
@@ -1463,11 +1682,52 @@ function toggleFinal(folder, evt) {{
   renderGrid();
 }}
 
-function toggleFlag(folder, evt) {{
+const FLAG_REASONS = [
+  {{id:"wrong-logo", label:"Wrong Logo", dot:"#c62828"}},
+  {{id:"needs-upscaling", label:"Needs Upscaling", dot:"#e65100"}},
+  {{id:"wrong-colour", label:"Wrong Colour", dot:"#283593"}},
+  {{id:"other", label:"Other", dot:"#6a1b9a"}},
+];
+let _flagMenuOpen = null;
+
+function showFlagMenu(folder, evt) {{
   if (evt) evt.stopPropagation();
-  if (flagged.has(folder)) flagged.delete(folder); else flagged.add(folder);
-  renderGrid();
+  // Close existing menu
+  closeFlagMenu();
+  if (flagged[folder]) {{
+    // Already flagged — unflag
+    delete flagged[folder];
+    renderGrid();
+    return;
+  }}
+  const btn = evt.currentTarget;
+  const rect = btn.getBoundingClientRect();
+  const menu = document.createElement("div");
+  menu.className = "flag-menu";
+  menu.style.left = rect.left + "px";
+  menu.style.top = (rect.bottom + 4) + "px";
+  menu.style.position = "fixed";
+  FLAG_REASONS.forEach(r => {{
+    const item = document.createElement("div");
+    item.className = "flag-menu-item";
+    item.innerHTML = `<span class="flag-dot" style="background:${{r.dot}}"></span>${{r.label}}`;
+    item.onclick = (e) => {{
+      e.stopPropagation();
+      flagged[folder] = r.id;
+      closeFlagMenu();
+      renderGrid();
+    }};
+    menu.appendChild(item);
+  }});
+  document.body.appendChild(menu);
+  _flagMenuOpen = menu;
 }}
+
+function closeFlagMenu() {{
+  if (_flagMenuOpen) {{ _flagMenuOpen.remove(); _flagMenuOpen = null; }}
+}}
+
+document.addEventListener("click", () => closeFlagMenu());
 
 // ─── DETAIL PANEL ───
 function openDetail(folder) {{
@@ -1533,14 +1793,15 @@ function openDetail(folder) {{
 
   const websiteLink = b.website ? `<dd><a href="${{b.website}}" target="_blank" style="color:#1a73e8;">${{b.website}}</a></dd>` : "<dd>N/A</dd>";
   const isFinal = finalized.has(b.folder);
-  const isFlagged = flagged.has(b.folder);
+  const isFlagged = !!flagged[b.folder];
 
   document.getElementById("detailPanel").innerHTML = `
     <div class="detail-header">
       <h2>${{b.name}}</h2>
       <span class="category-tag" style="font-size:11px;">${{b.category}}</span>
       <button class="btn-final ${{isFinal?"done":""}}" style="padding:6px 16px;font-size:12px;" onclick="toggleFinal('${{b.folder}}');openDetail('${{b.folder}}')">${{isFinal?"Finalized":"Mark Final"}}</button>
-      <button class="btn-flag ${{isFlagged?"active":""}}" style="padding:6px 12px;font-size:12px;" onclick="toggleFlag('${{b.folder}}');openDetail('${{b.folder}}')">${{isFlagged?"Unflag":"Flag"}}</button>
+      <button class="btn-flag ${{isFlagged?"active":""}}" style="padding:6px 12px;font-size:12px;" onclick="showFlagMenu('${{b.folder}}',event)">${{isFlagged?"Unflag":"Flag"}}</button>
+      ${{isFlagged ? `<span class="flag-badge ${{flagged[b.folder]}}" style="font-size:11px;padding:3px 8px;">${{FLAG_REASONS.find(r=>r.id===flagged[b.folder])?.label || flagged[b.folder]}}</span>` : ""}}
       <button class="close-btn" onclick="closeDetail()">&times;</button>
     </div>
     <div class="detail-body">
@@ -1581,7 +1842,10 @@ document.addEventListener("keydown", e => {{ if (e.key === "Escape") closeDetail
 function applyFilters(brands) {{
   if (activeFilter === "finalized") brands = brands.filter(b => finalized.has(b.folder));
   else if (activeFilter === "pending") brands = brands.filter(b => !finalized.has(b.folder));
-  else if (activeFilter === "flagged") brands = brands.filter(b => flagged.has(b.folder));
+  else if (activeFilter === "flagged") brands = brands.filter(b => !!flagged[b.folder]);
+  else if (activeFilter === "flag-wrong-logo") brands = brands.filter(b => flagged[b.folder] === "wrong-logo");
+  else if (activeFilter === "flag-needs-upscaling") brands = brands.filter(b => flagged[b.folder] === "needs-upscaling");
+  else if (activeFilter === "flag-wrong-colour") brands = brands.filter(b => flagged[b.folder] === "wrong-colour");
   else if (activeFilter === "low") brands = brands.filter(b => b.blending_risk === "LOW");
   else if (activeFilter === "high") brands = brands.filter(b => b.blending_risk === "HIGH");
   else if (activeFilter === "svg") brands = brands.filter(b => b.is_svg || b.has_svg_file);
@@ -1608,7 +1872,7 @@ function renderGrid() {{
   let html = "";
   for (const b of brands) {{
     const isFinal = finalized.has(b.folder);
-    const isFlagged = flagged.has(b.folder);
+    const isFlagged = !!flagged[b.folder];
     const shapeClass = shape === "circle" ? "shape-circle" : shape === "card" ? "shape-card" : "";
     const ac = getActiveColour(b);
     const rc = b.blending_risk === "LOW" ? "badge-low" : b.blending_risk === "MEDIUM" ? "badge-medium" : "badge-high";
@@ -1643,6 +1907,8 @@ function renderGrid() {{
     }}
 
     const websiteLink = b.website ? `<a class="website-link" href="${{b.website}}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${{b.website.replace(/^https?:\\/\\//, "").replace(/\\/$/,"")}}</a>` : "";
+    const flagReason = flagged[b.folder] || "";
+    const flagBadge = flagReason ? `<span class="flag-badge ${{flagReason}}">${{FLAG_REASONS.find(r=>r.id===flagReason)?.label || flagReason}}</span>` : "";
 
     html += `
       <div class="card ${{isFinal?"finalized":""}} ${{isFlagged?"flagged":""}}" data-folder="${{b.folder}}" onclick="openDetail('${{b.folder}}')">
@@ -1655,11 +1921,11 @@ function renderGrid() {{
           ${{websiteLink}}
           <span class="category-tag">${{b.category}}</span>
           <div class="meta-row"><span class="hex-display">${{ac}}</span><span>T${{b.tier}} ${{Math.round(b.confidence*100)}}%</span></div>
-          <div style="margin-top:3px">${{badges}}${{candCount}}</div>
+          <div style="margin-top:3px">${{badges}}${{candCount}}${{flagBadge}}</div>
           <div class="colour-options">${{swatches}}</div>
           <div class="card-actions">
             <button class="btn-final ${{isFinal?"done":""}}" onclick="toggleFinal('${{b.folder}}',event)">${{isFinal?"Finalized":"Mark Final"}}</button>
-            <button class="btn-flag ${{isFlagged?"active":""}}" onclick="toggleFlag('${{b.folder}}',event)">${{isFlagged?"Unflag":"Flag"}}</button>
+            <button class="btn-flag ${{isFlagged?"active":""}}" onclick="showFlagMenu('${{b.folder}}',event)">${{isFlagged?"Unflag":"Flag"}}</button>
           </div>
         </div>
       </div>`;
@@ -1669,7 +1935,7 @@ function renderGrid() {{
   const finalCount = finalized.size;
   document.getElementById("statTotal").textContent = `${{brands.length}} / ${{BRANDS.length}}`;
   document.getElementById("statFinal").textContent = `Finalized: ${{finalCount}}`;
-  document.getElementById("statFlagged").textContent = `Flagged: ${{flagged.size}}`;
+  document.getElementById("statFlagged").textContent = `Flagged: ${{Object.keys(flagged).length}}`;
   document.getElementById("progressFill").style.width = `${{Math.round(finalCount/BRANDS.length*100)}}%`;
 }}
 
@@ -1693,6 +1959,7 @@ function _buildExportData() {{
       logo_quality_score: b.logo_quality_score,
       logo_issues: b.logo_issues || [],
       original_size: b.original_size, undersize: b.undersize, bg_removed: b.bg_removed,
+      flag_reason: flagged[b.folder] || null,
     }};
   }});
 }}
@@ -1810,6 +2077,7 @@ def process_brand(brand_name: str, website: str,
         (0, "CSV provided",  lambda: None),  # placeholder, handled below
         (1, "Brandfetch",    lambda: tier1_brandfetch(brand_name, website)),
         (2, "Website scrape",lambda: tier2_website_scrape(website)),
+        (2, "Playwright SPA",lambda: tier2b_playwright_scrape(website)),  # SPA fallback
         (3, "Wikimedia",     lambda: tier3_wikimedia(brand_name)),
         (4, "Favicon",       lambda: tier4_google_favicon(website)),
         (5, "DuckDuckGo",    lambda: tier5_duckduckgo(brand_name)),
@@ -1847,8 +2115,12 @@ def process_brand(brand_name: str, website: str,
             break  # enough candidates
         try:
             td = tier_fn()
-        except Exception:
+        except Exception as e:
+            print(f"  [tier{tier_num}] {tier_name} error: {e}", flush=True)
             td = None
+        if not td:
+            # Debug: tier returned nothing
+            pass  # individual tier functions already print warnings
         if td:
             cand = {
                 "tier": tier_num, "tier_name": tier_name,

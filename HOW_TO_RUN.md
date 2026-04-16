@@ -1,11 +1,19 @@
-# How to Run the Brand Asset Pipeline v4
+# How to Run the Brand Asset Pipeline v5
 
 ## What you'll get
 A folder (e.g. `batch_1_assets/`) with:
 - **Each brand's logo** (transparent, square, 500x500 minimum) — plus SVG if found
-- **review.html** — interactive review page with expandable cards, logo picker, colour overrides, SVG recolour, mark-as-final, and export (JSON / CSV / ZIP)
+- **review.html** — interactive review page with expandable cards, logo picker, colour overrides, SVG recolour, structured flagging, and export (JSON / CSV / ZIP)
 - **review.csv** — spreadsheet with colours, confidence scores, blending risks
 - **pipeline_summary.json** — full processing results
+
+### New in v5
+- **Structured flagging** — flag brands as "Wrong Logo", "Needs Upscaling", "Wrong Colour", or "Other" instead of a generic flag. Filter by flag reason, and flag reasons are included in exports.
+- **Inline SVG extraction** — detects and extracts `<svg>` elements embedded directly in page HTML (e.g. Klook), not just SVG file links
+- **Playwright SPA fallback** — automatically detects client-rendered SPAs (Next.js, Nuxt, React) and uses headless Chromium to render the page before scraping (optional dependency)
+- **Better CDN fetch handling** — browser-like image headers, Referer/Origin headers for CDN access (fixes Shopify CDN blocks), protocol-relative URL support (`//cdn.example.com`)
+- **Wider aspect ratio tolerance** — wordmark logos up to 10:1 aspect ratio are accepted (was 4:1)
+- **Debug logging** — console warnings when image fetches fail, with HTTP status codes and reasons
 
 ### New in v4
 - **Expandable detail panel** — click any card to see full info, pick between logo options, recolour SVGs, compare sources
@@ -69,6 +77,13 @@ This downloads everything including the AI model for background removal (~170MB)
 
 **Note:** `cairosvg` is for SVG rendering. If it fails to install, that's okay — the pipeline works without it, you just won't get SVG rasterisation. Try `brew install cairo` first if it fails.
 
+**Optional — Playwright for SPA sites** (recommended):
+```
+pip install playwright
+python -m playwright install chromium
+```
+This installs a headless browser (~150MB) for scraping JavaScript-rendered sites like Myprotein, NatHabit, Binge Town, etc. Without it, the pipeline gracefully skips SPA rendering and relies on other tiers.
+
 ---
 
 ### Step 7: Run batch 1
@@ -88,6 +103,8 @@ python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_asset
 - Quick run: ~10-20 minutes for 100 brands
 - Multi + threads: ~15-20 minutes (more work per brand, but parallel)
 - Console symbols: ✅ = good, ⚠️ = needs attention, ❌ = couldn't find logo, [SVG] = vector found, [3 opts] = multiple logo options found
+- Debug lines: `[fetch]` warnings show exactly why an image failed to download
+- `[playwright]` lines show when SPA rendering kicks in
 - At the end: source effectiveness table showing hits per tier
 
 ---
@@ -106,9 +123,18 @@ open batch_1_assets/review.html
 - **Size slider**: make cards bigger or smaller
 - **Sort by**: Name, Confidence, Blending Risk, Source Tier, Category
 - **Category filter**: dropdown to show one category at a time
-- **Filter buttons**: All / Finalized / Pending / Flagged / Low risk / High risk / SVG / Logo issues
+- **Filter buttons**: All / Finalized / Pending / Flagged / Wrong Logo / Needs Upscaling / Wrong Colour / Low risk / High risk / SVG / Logo issues
 - **Colour swatches** on each card: click to change background colour
-- **Mark as Final / Flag** buttons on each card
+- **Mark as Final** button on each card
+- **Flag** button — click to choose a flag reason from the dropdown menu. Click again on a flagged card to unflag.
+
+### Flag reasons
+| Flag | Badge colour | Use when... |
+|------|-------------|-------------|
+| Wrong Logo | Red | The image isn't actually the brand's logo |
+| Needs Upscaling | Orange | Logo is too small or pixelated |
+| Wrong Colour | Blue | Extracted brand colour doesn't match |
+| Other | Purple | Any other issue needing attention |
 
 ### Expanded detail view (click any card)
 - **Larger logo preview** with the selected background colour
@@ -117,11 +143,12 @@ open batch_1_assets/review.html
 - **Background colour swatches** — bigger, easier to compare
 - **Source info** — tier, source URL, dimensions, confidence
 - **Website link** — opens the brand's website in a new tab
+- **Flag reason badge** — shown next to the flag button when a card is flagged
 - Press **Escape** or click outside to close
 
 ### Exporting
-- **Export JSON** — finalized brands with full metadata
-- **Export CSV** — same data, flat format
+- **Export JSON** — finalized brands with full metadata (includes `flag_reason` field)
+- **Export CSV** — same data, flat format (includes `flag_reason` column)
 - **Export ZIP** — downloads a zip containing: `logos/Brand_Name.png` for each finalized brand, plus `brand_data.csv` and `brand_data.json`
 - The progress bar shows how many brands you've finalized out of total
 
@@ -159,7 +186,8 @@ And so on for batch_3 through batch_6.
 |------|--------|------|
 | 0 | CSV-provided URL | Direct link |
 | 1 | Brandfetch / logo.dev | CDN + API |
-| 2 | Website scraping | HTML parsing |
+| 2 | Website scraping | HTML parsing + inline SVG extraction |
+| 2b | Playwright SPA fallback | Headless browser (optional) |
 | 3 | Wikimedia Commons / Wikipedia | Search API |
 | 4 | Google Favicon | Free API |
 | 5 | DuckDuckGo | Instant Answer API |
@@ -183,6 +211,10 @@ Without `--multi`, the script stops at the first tier that finds a logo. With `-
 | Yellow **UPSCALED** | Original logo was under 500px |
 | Red **!** | Logo validation flagged issues (wrong image?) |
 | Grey **N opts** | Number of logo candidates available (with --multi) |
+| Red **Wrong Logo** | Flagged by reviewer as wrong image |
+| Orange **Needs Upscaling** | Flagged by reviewer as too small |
+| Blue **Wrong Colour** | Flagged by reviewer as colour mismatch |
+| Purple **Other** | Flagged by reviewer for other reasons |
 
 ---
 
@@ -202,6 +234,15 @@ First brand takes longer (downloading the AI model). After that, ~5-10 seconds p
 
 **cairosvg install fails**
 Try: `brew install cairo` first, then `pip install cairosvg`. Or skip it — SVGs will still be saved, just not rasterised.
+
+**Playwright install fails**
+Try: `python -m playwright install --with-deps chromium`. On Mac, you may need `brew install --cask chromium` first. The pipeline works without Playwright — it just skips SPA rendering.
+
+**"[playwright] SPA detected, rendering..." but still no logo**
+The SPA site may require authentication or have aggressive bot detection. Check the brand's website manually.
+
+**Lots of `[fetch]` warnings in the console**
+These are debug logs showing why image downloads failed. Common reasons: HTTP 403 (CDN blocking), too-small images, wrong content type. These help diagnose which sources need attention.
 
 **Lots of failures**
 Some brands don't have good logos online. That's expected. Check the source effectiveness table at the end — if a tier has zero hits, it may not be useful for your brand set.
