@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+brand_env/
+*.egg-info/
+batch_*_assets/
+brand_assets/

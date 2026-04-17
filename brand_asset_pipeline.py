@@ -36,11 +36,12 @@ Output: ./brand_assets/<brand>/  with logo.png, logo.svg (if found), meta.json
         ./brand_assets/review.csv    (spreadsheet for review)
 """
 
-import argparse, csv, json, os, re, sys, time, hashlib, base64, concurrent.futures
+import argparse, csv, json, os, re, sys, time, hashlib, base64, concurrent.futures, logging
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from io import BytesIO
 from collections import Counter
+from xml.etree import ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
@@ -63,12 +64,34 @@ try:
 except ImportError:
     HAS_PLAYWRIGHT = False
 
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+# Two loggers: 'pipeline' goes to pipeline.log (verbose), terminal stays clean.
+log = logging.getLogger("pipeline")
+log.setLevel(logging.DEBUG)
+# File handler added in main() once we know the output directory.
+# Console handler: only WARNING+ by default (overridable with --log-level debug).
+_console_handler = logging.StreamHandler(sys.stderr)
+_console_handler.setLevel(logging.WARNING)
+_console_handler.setFormatter(logging.Formatter("%(message)s"))
+log.addHandler(_console_handler)
+
+
+def _setup_file_logging(out_dir: Path, console_level: str = "info"):
+    """Attach file handler to the pipeline logger. Called once from main()."""
+    fh = logging.FileHandler(out_dir / "pipeline.log", mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(fh)
+    if console_level == "debug":
+        _console_handler.setLevel(logging.DEBUG)
+
+
 # ─── GLOBAL CONFIG (set by CLI args in main()) ────────────────────────────────
 OUT_DIR = Path("./brand_assets")
 REMBG_MODEL = "u2net"
 ALPHA_MATTING = False
-MULTI_CANDIDATES = False
-TARGET_SIZE = 500
+CANDIDATE_CAP = 50        # max candidates per brand
+TARGET_SIZE = 500         # minimum output size (upscale if below)
 
 # ─── SAFE JSON ENCODER ─────────────────────────────────────────────────────────
 
@@ -88,8 +111,7 @@ class SafeEncoder(json.JSONEncoder):
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 TIMEOUT = 15
-MIN_LOGO_SIZE = 200       # reject raster images smaller than this during sourcing
-TARGET_SIZE = 500         # output logo size (minimum guaranteed)
+MIN_LOGO_SIZE = 48        # lowered — we keep everything, even small favicons as candidates
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -100,9 +122,6 @@ IMAGE_HEADERS = {
     **HEADERS,
     "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
 }
-OUT_DIR = Path("./brand_assets")
-REMBG_MODEL = "u2net"
-ALPHA_MATTING = False
 
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
@@ -129,17 +148,17 @@ def _fetch_svg(url: str) -> bytes | None:
             url = "https:" + url
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code != 200:
-            print(f"  [svg] HTTP {resp.status_code} fetching {url[:80]}", flush=True)
+            log.debug(f"[svg] HTTP {resp.status_code} fetching {url[:80]}")
             return None
         content = resp.content
         # Basic SVG validation
         text = content.decode("utf-8", errors="ignore")[:2000]
         if "<svg" in text.lower():
             return content
-        print(f"  [svg] No <svg> tag in response from {url[:80]}", flush=True)
+        log.debug(f"[svg] No <svg> tag in response from {url[:80]}")
         return None
     except Exception as e:
-        print(f"  [svg] Exception fetching {url[:80]}: {e}", flush=True)
+        log.debug(f"[svg] Exception fetching {url[:80]}: {e}")
         return None
 
 
@@ -151,8 +170,97 @@ def _svg_to_pil(svg_bytes: bytes, size: int = 500) -> Image.Image | None:
         png_data = cairosvg.svg2png(bytestring=svg_bytes, output_width=size, output_height=size)
         return Image.open(BytesIO(png_data)).convert("RGBA")
     except Exception as e:
-        print(f"[svg] cairosvg failed: {e}", flush=True)
+        log.debug(f"[svg] cairosvg failed: {e}")
         return None
+
+
+def make_svg_square(svg_bytes: bytes) -> bytes:
+    """
+    Make SVG square by expanding viewBox/width/height on shorter dimension, centering content.
+    If parsing fails, return original SVG unchanged.
+    """
+    try:
+        root = ET.fromstring(svg_bytes)
+        ns = {"svg": "http://www.w3.org/2000/svg"}
+        ET.register_namespace("", "http://www.w3.org/2000/svg")
+
+        # Get viewBox or width/height
+        viewbox = root.get("viewBox")
+        width_attr = root.get("width")
+        height_attr = root.get("height")
+
+        if viewbox:
+            try:
+                parts = viewbox.split()
+                vx, vy, vw, vh = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+                # Make square
+                if vw != vh:
+                    max_dim = max(vw, vh)
+                    offset_w = (max_dim - vw) / 2
+                    offset_h = (max_dim - vh) / 2
+                    root.set("viewBox", f"{vx - offset_w} {vy - offset_h} {max_dim} {max_dim}")
+            except Exception:
+                pass  # Malformed viewBox, leave it
+        else:
+            # Try width/height attributes
+            try:
+                w = float(width_attr) if width_attr and "%" not in width_attr else None
+                h = float(height_attr) if height_attr and "%" not in height_attr else None
+                if w and h and w != h:
+                    max_dim = max(w, h)
+                    root.set("width", str(max_dim))
+                    root.set("height", str(max_dim))
+            except Exception:
+                pass
+
+        return ET.tostring(root, encoding="utf-8")
+    except Exception as e:
+        log.debug(f"[svg-square] Failed to parse SVG: {e}")
+        return svg_bytes  # Return original if parsing fails
+
+
+def recolour_svg(svg_bytes: bytes, hex_colour: str) -> bytes:
+    """
+    Replace fill and stroke attributes (excluding 'none' and 'url(...)') with target colour.
+    Also replaces inline style fill: and stroke: values.
+    Returns modified SVG bytes.
+    """
+    try:
+        svg_str = svg_bytes.decode("utf-8", errors="replace")
+
+        # Replace fill="..." and stroke="..." attributes
+        # Skip 'none' and 'url(...)' values
+        svg_str = re.sub(
+            r'fill="(?!none|url\()([^"]*)"',
+            f'fill="{hex_colour}"',
+            svg_str,
+            flags=re.IGNORECASE
+        )
+        svg_str = re.sub(
+            r'stroke="(?!none|url\()([^"]*)"',
+            f'stroke="{hex_colour}"',
+            svg_str,
+            flags=re.IGNORECASE
+        )
+
+        # Replace inline style fill: and stroke: (without url(...) or none)
+        svg_str = re.sub(
+            r'fill\s*:\s*(?!none|url\()([^;}"]*)',
+            f'fill: {hex_colour}',
+            svg_str,
+            flags=re.IGNORECASE
+        )
+        svg_str = re.sub(
+            r'stroke\s*:\s*(?!none|url\()([^;}"]*)',
+            f'stroke: {hex_colour}',
+            svg_str,
+            flags=re.IGNORECASE
+        )
+
+        return svg_str.encode("utf-8")
+    except Exception as e:
+        log.debug(f"[svg-recolour] Failed to recolour SVG: {e}")
+        return svg_bytes  # Return original if processing fails
 
 
 def _fetch_image(url: str, referer: str = "") -> tuple[Image.Image | None, bool, bytes | None]:
@@ -171,45 +279,37 @@ def _fetch_image(url: str, referer: str = "") -> tuple[Image.Image | None, bool,
         hdrs["Referer"] = referer
         hdrs["Origin"] = urlparse(referer).scheme + "://" + urlparse(referer).netloc
 
-    # SVG handling
+    # SVG handling: return raw bytes, no rasterization
     svg_data = None
     if _is_svg_url(url):
         svg_data = _fetch_svg(url)
         if svg_data:
-            img = _svg_to_pil(svg_data)
-            if img:
-                return img, True, svg_data
-            # SVG found but can't rasterize — fall through to try as raster
-            # (some .svg URLs actually return raster fallbacks)
+            return None, True, svg_data  # Return SVG data without PIL Image
 
     try:
         resp = requests.get(url, headers=hdrs, timeout=TIMEOUT, stream=True)
         if resp.status_code != 200:
-            print(f"  [fetch] HTTP {resp.status_code} for {url[:80]}", flush=True)
+            log.debug(f"[fetch] HTTP {resp.status_code} for {url[:80]}")
             # Retry once with plain HEADERS if image headers failed
             resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True)
             if resp.status_code != 200:
-                print(f"  [fetch] Retry also failed: HTTP {resp.status_code}", flush=True)
+                log.debug(f"[fetch] Retry also failed: HTTP {resp.status_code}")
                 return None, False, svg_data
         ct = resp.headers.get("Content-Type", "")
         # Check if response is SVG
         if "svg" in ct:
             svg_data = resp.content
-            img = _svg_to_pil(svg_data)
-            if img:
-                return img, True, svg_data
-            # Have SVG data but can't rasterize — return None image but keep svg_data
-            return None, True, svg_data
+            return None, True, svg_data  # Return SVG data without rasterizing
         if "image" not in ct and "octet" not in ct:
-            print(f"  [fetch] Unexpected content-type '{ct}' for {url[:80]}", flush=True)
+            log.debug(f"[fetch] Unexpected content-type '{ct}' for {url[:80]}")
             return None, False, svg_data
         img = Image.open(BytesIO(resp.content))
         if img.width < MIN_LOGO_SIZE or img.height < MIN_LOGO_SIZE:
-            print(f"  [fetch] Image too small ({img.width}x{img.height}) from {url[:80]}", flush=True)
+            log.debug(f"[fetch] Image too small ({img.width}x{img.height}) from {url[:80]}")
             return None, False, svg_data
         return img, False, svg_data
     except Exception as e:
-        print(f"  [fetch] Exception fetching {url[:80]}: {e}", flush=True)
+        log.debug(f"[fetch] Exception fetching {url[:80]}: {e}")
         return None, False, svg_data
 
 
@@ -235,14 +335,12 @@ def tier1_brandfetch(brand_name: str, website: str = "") -> dict | None:
                     continue
                 ct = resp.headers.get("Content-Type", "")
                 if "svg" in ct:
-                    img = _svg_to_pil(resp.content)
-                    if img:
-                        return {
-                            "source": "brandfetch:logodev-svg",
-                            "image": img, "svg_data": resp.content,
-                            "is_svg": True, "url": logo_url,
-                            "domain": domain, "confidence": 0.92,
-                        }
+                    return {
+                        "source": "brandfetch:logodev-svg",
+                        "image": None, "svg_data": resp.content,
+                        "is_svg": True, "url": logo_url,
+                        "domain": domain, "confidence": 0.92,
+                    }
                 elif "image" in ct:
                     img = Image.open(BytesIO(resp.content))
                     if img.width >= MIN_LOGO_SIZE and img.height >= MIN_LOGO_SIZE:
@@ -252,7 +350,8 @@ def tier1_brandfetch(brand_name: str, website: str = "") -> dict | None:
                             "url": logo_url, "domain": domain,
                             "confidence": 0.85,
                         }
-            except:
+            except Exception as e:
+                log.debug(f"[tier1-logodev] Error: {e}")
                 continue
 
     # Strategy 1b: Brandfetch search API (free, no key)
@@ -290,13 +389,14 @@ def tier1_brandfetch(brand_name: str, website: str = "") -> dict | None:
                                 "brand_name_api": best.get("name", brand_name),
                                 "confidence": 0.82,
                             }
-            except:
+            except Exception as e:
+                log.debug(f"[tier1-logodev-via-search] Error: {e}")
                 pass
 
         # Fall back to the icon from search result
         if icon_url:
             img, is_svg, svg_raw = _fetch_image(icon_url)
-            if img:
+            if img or (is_svg and svg_raw):  # Accept SVG even if image is None
                 result = {
                     "source": "brandfetch:search-icon",
                     "image": img, "is_svg": is_svg,
@@ -307,7 +407,8 @@ def tier1_brandfetch(brand_name: str, website: str = "") -> dict | None:
                 if svg_raw:
                     result["svg_data"] = svg_raw
                 return result
-    except:
+    except Exception as e:
+        log.debug(f"[tier1] Error: {e}")
         pass
 
     return None
@@ -326,7 +427,8 @@ def tier2_website_scrape(website_url: str) -> dict | None:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
         base = resp.url
-    except:
+    except Exception as e:
+        log.debug(f"[tier2] Error fetching {website_url}: {e}")
         return None
 
     candidates = []
@@ -349,7 +451,7 @@ def tier2_website_scrape(website_url: str) -> dict | None:
                 candidates.append(("svg-img", urljoin(base, src), 0.93))
 
     # Priority 0.5: Inline <svg> elements in header/nav/logo containers
-    _inline_svg_found = False
+    _inline_svg_bytes = None
     _logo_containers = soup.find_all(
         lambda tag: tag.name in ("header", "nav", "a", "div", "span")
         and any("logo" in (v if isinstance(v, str) else " ".join(v)).lower()
@@ -363,21 +465,17 @@ def tier2_website_scrape(website_url: str) -> dict | None:
             _logo_containers.append(a_tag)
     for container in _logo_containers:
         svg_el = container.find("svg")
-        if svg_el and not _inline_svg_found:
+        if svg_el and not _inline_svg_bytes:
             svg_str = str(svg_el)
             if len(svg_str) > 100:  # skip trivial/icon SVGs
                 # Ensure the SVG has xmlns for standalone rendering
                 if "xmlns" not in svg_str:
                     svg_str = svg_str.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
                 svg_bytes = svg_str.encode("utf-8")
-                img = _svg_to_pil(svg_bytes, TARGET_SIZE)
-                if img:
-                    # Add as a candidate, not an early return — let it compete
-                    candidates.append(("inline-svg", website_url, 0.9))
-                    # Stash the pre-rasterized image + SVG data for later retrieval
-                    _inline_svg_found = True
-                    _inline_svg_img = img
-                    _inline_svg_bytes = svg_bytes
+                # Add as a candidate, not an early return — let it compete
+                candidates.append(("inline-svg", website_url, 0.9))
+                # Stash the SVG data for later retrieval (no rasterization)
+                _inline_svg_bytes = svg_bytes
 
     # Priority 1: apple-touch-icon
     for link in soup.find_all("link", rel=lambda r: r and "apple-touch-icon" in " ".join(r).lower()):
@@ -425,11 +523,11 @@ def tier2_website_scrape(website_url: str) -> dict | None:
     candidates.sort(key=lambda x: -x[2])
     fetched = []
     for source_type, url, confidence in candidates:
-        # Inline SVGs are already rasterized — no fetch needed
-        if source_type == "inline-svg" and _inline_svg_found:
+        # Inline SVGs already found — no fetch needed
+        if source_type == "inline-svg" and _inline_svg_bytes:
             fetched.append({
                 "source": "website:inline-svg",
-                "image": _inline_svg_img,
+                "image": None,
                 "is_svg": True,
                 "svg_data": _inline_svg_bytes,
                 "url": url,
@@ -438,7 +536,7 @@ def tier2_website_scrape(website_url: str) -> dict | None:
             })
             continue
         img, is_svg, svg_raw = _fetch_image(url, referer=website_url)
-        if img:
+        if img or (is_svg and svg_raw):  # Accept SVG even if image is None
             r = {
                 "source": f"website:{source_type}",
                 "image": img,
@@ -453,10 +551,10 @@ def tier2_website_scrape(website_url: str) -> dict | None:
 
     if not fetched:
         return None
-    # In multi mode, return all fetched candidates; otherwise just the best
-    if MULTI_CANDIDATES and len(fetched) > 1:
+    # Always return full list if multiple found
+    if len(fetched) > 1:
         return fetched  # list of dicts
-    return fetched[0]   # single dict (classic behaviour)
+    return fetched[0]   # single dict
 
 
 def _is_spa_html(html: str) -> bool:
@@ -490,7 +588,7 @@ def tier2b_playwright_scrape(website_url: str) -> dict | None:
         if not _is_spa_html(resp.text):
             return None  # not a SPA, no need for Playwright
 
-        print(f"  [playwright] SPA detected, rendering {website_url}...", flush=True)
+        log.info(f"[playwright] SPA detected, rendering {website_url}...")
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -521,15 +619,13 @@ def tier2b_playwright_scrape(website_url: str) -> dict | None:
                 if "xmlns" not in svg_str:
                     svg_str = svg_str.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
                 svg_bytes = svg_str.encode("utf-8")
-                img = _svg_to_pil(svg_bytes, TARGET_SIZE)
-                if img:
-                    tc = soup.find("meta", attrs={"name": "theme-color"})
-                    return {
-                        "source": "website:playwright-inline-svg",
-                        "image": img, "is_svg": True, "svg_data": svg_bytes,
-                        "url": website_url, "confidence": 0.88,
-                        "theme_color": tc["content"].strip() if tc and tc.get("content") else None,
-                    }
+                tc = soup.find("meta", attrs={"name": "theme-color"})
+                return {
+                    "source": "website:playwright-inline-svg",
+                    "image": None, "is_svg": True, "svg_data": svg_bytes,
+                    "url": website_url, "confidence": 0.88,
+                    "theme_color": tc["content"].strip() if tc and tc.get("content") else None,
+                }
 
         # SVG <img> tags
         for img_tag in soup.find_all("img", src=True):
@@ -569,7 +665,7 @@ def tier2b_playwright_scrape(website_url: str) -> dict | None:
 
         for source_type, url, confidence in candidates:
             img, is_svg, svg_raw = _fetch_image(url, referer=website_url)
-            if img:
+            if img or (is_svg and svg_raw):  # Accept SVG even if image is None
                 result = {
                     "source": f"website:playwright-{source_type}",
                     "image": img, "is_svg": is_svg,
@@ -581,7 +677,7 @@ def tier2b_playwright_scrape(website_url: str) -> dict | None:
                 return result
 
     except Exception as e:
-        print(f"  [playwright] Error: {e}", flush=True)
+        log.debug(f"[playwright] Error: {e}")
     return None
 
 
@@ -623,14 +719,12 @@ def tier3_wikimedia(brand_name: str) -> dict | None:
                 if is_svg:
                     svg_data = _fetch_svg(file_url)
                     if svg_data:
-                        img = _svg_to_pil(svg_data)
-                        if img:
-                            return {
-                                "source": "wikimedia:commons-svg",
-                                "image": img, "svg_data": svg_data,
-                                "is_svg": True, "url": file_url,
-                                "confidence": 0.8,
-                            }
+                        return {
+                            "source": "wikimedia:commons-svg",
+                            "image": None, "svg_data": svg_data,
+                            "is_svg": True, "url": file_url,
+                            "confidence": 0.8,
+                        }
                 else:
                     img, _, _ = _fetch_image(file_url)
                     if img:
@@ -639,7 +733,8 @@ def tier3_wikimedia(brand_name: str) -> dict | None:
                             "image": img, "is_svg": False,
                             "url": file_url, "confidence": 0.7,
                         }
-    except:
+    except Exception as e:
+        log.debug(f"[tier3-commons] Error: {e}")
         pass
 
     # Strategy 3b: Wikipedia page image (from infobox)
@@ -665,15 +760,12 @@ def tier3_wikimedia(brand_name: str) -> dict | None:
                         svg_url = f"https://commons.wikimedia.org/wiki/Special:FilePath/{requests.utils.quote(original)}"
                         found_svg_data = _fetch_svg(svg_url)
                         if found_svg_data:
-                            img = _svg_to_pil(found_svg_data)
-                            if img:
-                                return {
-                                    "source": "wikimedia:wikipedia-svg",
-                                    "image": img, "svg_data": found_svg_data,
-                                    "is_svg": True, "url": svg_url,
-                                    "confidence": 0.75,
-                                }
-                            # SVG exists but can't rasterize — use thumb but keep SVG
+                            return {
+                                "source": "wikimedia:wikipedia-svg",
+                                "image": None, "svg_data": found_svg_data,
+                                "is_svg": True, "url": svg_url,
+                                "confidence": 0.75,
+                            }
                     # Fall back to thumbnail (carry SVG data if we found it)
                     img, is_svg, svg_raw = _fetch_image(thumb)
                     if img:
@@ -686,7 +778,8 @@ def tier3_wikimedia(brand_name: str) -> dict | None:
                             result["svg_data"] = found_svg_data
                             result["is_svg"] = True  # we have the SVG even if image is raster
                         return result
-    except:
+    except Exception as e:
+        log.debug(f"[tier3-wikipedia] Error: {e}")
         pass
 
     return None
@@ -709,7 +802,8 @@ def _wikimedia_file_url(title: str) -> str | None:
                 continue
             info = page.get("imageinfo", [{}])[0]
             return info.get("url")
-    except:
+    except Exception as e:
+        log.debug(f"[wikimedia-file-url] Error: {e}")
         return None
 
 
@@ -737,7 +831,8 @@ def tier4_google_favicon(website_url: str) -> dict | None:
             "url": url,
             "confidence": 0.4,
         }
-    except:
+    except Exception as e:
+        log.debug(f"[tier4] Error: {e}")
         return None
 
 
@@ -761,7 +856,7 @@ def tier5_duckduckgo(brand_name: str) -> dict | None:
             if img_url.startswith("/"):
                 img_url = "https://duckduckgo.com" + img_url
             img, is_svg, svg_raw = _fetch_image(img_url)
-            if img:
+            if img or (is_svg and svg_raw):  # Accept SVG even if image is None
                 r = {
                     "source": "duckduckgo",
                     "image": img, "is_svg": is_svg,
@@ -785,7 +880,8 @@ def tier5_duckduckgo(brand_name: str) -> dict | None:
                                 "image": img, "is_svg": is_svg,
                                 "url": iurl, "confidence": 0.5,
                             }
-    except:
+    except Exception as e:
+        log.debug(f"[tier5] Error: {e}")
         pass
     return None
 
@@ -818,15 +914,14 @@ def tier6_gilbarbara(brand_name: str) -> dict | None:
                 continue
             ct = resp.headers.get("Content-Type", "")
             if "svg" in ct or "<svg" in resp.text[:500].lower():
-                img = _svg_to_pil(resp.content)
-                if img:
-                    return {
-                        "source": "gilbarbara-svg",
-                        "image": img, "svg_data": resp.content,
-                        "is_svg": True, "url": url,
-                        "confidence": 0.75,
-                    }
-        except:
+                return {
+                    "source": "gilbarbara-svg",
+                    "image": None, "svg_data": resp.content,
+                    "is_svg": True, "url": url,
+                    "confidence": 0.75,
+                }
+        except Exception as e:
+            log.debug(f"[tier6-gilbarbara] Error for {s}: {e}")
             continue
 
     return None
@@ -894,7 +989,7 @@ def tier7_seeklogo(brand_name: str) -> dict | None:
             return None
 
         img, found_svg, svg_raw = _fetch_image(img_url)
-        if not img:
+        if not img and not (found_svg and svg_raw):
             return None
 
         result = {
@@ -905,7 +1000,8 @@ def tier7_seeklogo(brand_name: str) -> dict | None:
         if svg_raw:
             result["svg_data"] = svg_raw
         return result
-    except:
+    except Exception as e:
+        log.debug(f"[tier7] Error: {e}")
         return None
 
 
@@ -927,9 +1023,6 @@ def tier8_simple_icons(brand_name: str) -> dict | None:
             return None
         if "<svg" not in resp.text[:500].lower():
             return None
-        img = _svg_to_pil(resp.content)
-        if not img:
-            return None
 
         # Also try to get the brand colour from Simple Icons JSON
         si_colour = None
@@ -943,17 +1036,19 @@ def tier8_simple_icons(brand_name: str) -> dict | None:
                        re.sub(r'[^a-z0-9]', '', icon.get("title", "").lower()) == slug:
                         si_colour = f"#{icon['hex']}"
                         break
-        except:
+        except Exception as e:
+            log.debug(f"[tier8-si-colour] Error: {e}")
             pass
 
         return {
             "source": "simpleicons-svg",
-            "image": img, "svg_data": resp.content,
+            "image": None, "svg_data": resp.content,
             "is_svg": True, "url": url,
             "confidence": 0.65,
             "si_colour": si_colour,  # bonus: brand colour from their DB
         }
-    except:
+    except Exception as e:
+        log.debug(f"[tier8] Error: {e}")
         return None
 
 
@@ -1008,7 +1103,7 @@ def auto_crop_transparent(img: Image.Image, padding_pct: float = 0.08) -> Image.
 
 
 def process_logo(img: Image.Image) -> Image.Image:
-    """Make logo square with padding, resize to at least TARGET_SIZE."""
+    """Make logo square with padding. Preserve resolution — upscale if below TARGET_SIZE, keep native if above."""
     img = img.convert("RGBA")
 
     # Make square
@@ -1019,9 +1114,10 @@ def process_logo(img: Image.Image) -> Image.Image:
         padded.paste(img, ((size - w) // 2, (size - h) // 2), img)
         img = padded
 
-    # Resize — always to TARGET_SIZE (upscale if needed)
-    if img.width != TARGET_SIZE:
+    # Resize: upscale if below TARGET_SIZE, keep native resolution if above
+    if img.width < TARGET_SIZE:
         img = img.resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
+    # If above TARGET_SIZE, keep native resolution
 
     return img
 
@@ -1355,7 +1451,7 @@ def validate_logo(img: Image.Image, brand_name: str) -> dict:
 # ─── HTML REVIEW PAGE ──────────────────────────────────────────────────────
 
 def generate_review_html(results: list, out_dir: Path) -> Path | None:
-    """Generate interactive HTML review page with colour override, mark-as-final, categories."""
+    """Generate interactive HTML review page with colour override, mark-as-final, categories, and candidate selection."""
     successful = [r for r in results if r["status"] == "success"]
     failed = [r for r in results if r["status"] != "success"]
     if not successful and not failed:
@@ -1368,22 +1464,20 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
     brands_js = []
     for r in successful:
         safe_name = re.sub(r'[^a-z0-9_]', '_', r["brand_name"].lower()).strip("_")
-        logo_path = out_dir / safe_name / "logo.png"
-        logo_b64 = ""
-        if logo_path.exists():
-            logo_b64 = base64.b64encode(logo_path.read_bytes()).decode()
 
-        svg_path = out_dir / safe_name / "logo.svg"
-        has_svg = svg_path.exists()
-        svg_markup = ""
-        if has_svg:
-            try:
-                raw = svg_path.read_text(errors="replace")
-                # Only embed if it's a real SVG and not excessively large
-                if "<svg" in raw.lower() and len(raw) < 200_000:
-                    svg_markup = raw
-            except Exception:
-                pass
+        # Find the selected/primary logo and use its thumb_b64 as logo_b64
+        logo_b64 = ""
+        candidates = r.get("logo_candidates", [])
+        if candidates:
+            # Find the selected candidate, or use the first one
+            sel_cand = next((c for c in candidates if c.get("is_selected")), candidates[0])
+            logo_b64 = sel_cand.get("thumb_b64", "")
+
+        # Legacy fallback: read from disk if no candidates
+        if not logo_b64:
+            logo_path = out_dir / safe_name / "logo.png"
+            if logo_path.exists():
+                logo_b64 = base64.b64encode(logo_path.read_bytes()).decode()
 
         brands_js.append({
             "name": r["brand_name"],
@@ -1398,8 +1492,6 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
             "has_transparency": r.get("has_transparency", False),
             "bg_removed": r.get("bg_removed", False),
             "is_svg": r.get("is_svg", False),
-            "has_svg_file": has_svg,
-            "svg_markup": svg_markup,
             "undersize": r.get("undersize", False),
             "original_size": r.get("original_size", ""),
             "category": r.get("category", "Uncategorized"),
@@ -1407,7 +1499,7 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
             "logo_quality_score": r.get("logo_quality_score", 1.0),
             "logo_issues": r.get("logo_issues", []),
             "logo_b64": logo_b64,
-            "logo_candidates": r.get("logo_candidates", []),
+            "logo_candidates": candidates,  # Full candidate list with thumb_b64, is_svg, file, tier, tier_name, source, confidence, size, svg_markup
         })
 
     brands_json = json.dumps(brands_js, cls=SafeEncoder)
@@ -1419,7 +1511,7 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Brand Asset Pipeline v4 — Review</title>
+<title>Brand Asset Pipeline v6 — Review</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
@@ -1523,6 +1615,8 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
   .logo-option img {{ width:80px; height:80px; object-fit:contain; display:block; margin:0 auto 6px; }}
   .logo-option .lo-label {{ font-size:10px; color:#666; }}
   .logo-option .lo-source {{ font-size:9px; color:#999; }}
+  .lo-path {{ font-size:8px; color:#aaa; word-break:break-all; margin-top:2px; font-family:monospace; }}
+  .lo-format {{ font-size:8px; display:inline-block; margin-top:2px; padding:1px 4px; border-radius:3px; background:#eee; color:#666; }}
   .recolour-section {{ padding:12px 0; border-top:1px solid #eee; }}
   .recolour-section h4 {{ font-size:12px; color:#666; margin-bottom:8px; }}
   .recolour-controls {{ display:flex; align-items:center; gap:10px; }}
@@ -1534,7 +1628,7 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
 </head>
 <body>
 <div class="toolbar">
-  <h1>Brand Assets v4</h1>
+  <h1>Brand Assets v6</h1>
   <div class="control-group"><label>Shape</label>
     <select id="shapeSelect"><option value="square">Square</option><option value="circle">Circle</option><option value="card">Card (14:9)</option></select>
   </div>
@@ -1765,12 +1859,15 @@ function openDetail(folder) {{
     logoPicker = `<h4 style="font-size:12px;color:#666;margin-bottom:8px;">Logo options (${{b.logo_candidates.length}})</h4><div class="logo-picker">`;
     b.logo_candidates.forEach((c, i) => {{
       const sel = i === selIdx ? "selected" : "";
-      const svgBadge = c.is_svg ? ' <span class="badge badge-svg" style="font-size:8px;">SVG</span>' : "";
+      const svgBadge = c.is_svg ? ' <span class="badge badge-svg" style="font-size:8px;">SVG</span>' : ' <span class="badge" style="background:#ddd;color:#555;font-size:8px;">PNG</span>';
+      const dims = c.size || "unknown";
+      const filePath = c.file || "unknown";
       logoPicker += `<div class="logo-option ${{sel}}" onclick="selectLogo('${{b.folder}}',${{i}})">
         <img src="data:image/png;base64,${{c.thumb_b64}}" alt="Option ${{i+1}}">
-        <div class="lo-label">T${{c.tier}}: ${{c.tier_name}}${{svgBadge}}</div>
-        <div class="lo-source">${{c.size}} | ${{Math.round(c.confidence*100)}}%</div>
-        <div class="lo-source" style="word-break:break-all;">${{c.url ? c.url.substring(0,60) : ""}}</div>
+        <div class="lo-label">T${{c.tier}}: ${{c.tier_name}}</div>
+        <div class="lo-source">${{dims}} | ${{Math.round(c.confidence*100)}}%</div>
+        <div class="lo-path">${{filePath}}</div>
+        <div class="lo-format">${{svgBadge}}</div>
       </div>`;
     }});
     logoPicker += "</div>";
@@ -1860,7 +1957,7 @@ function applyFilters(brands) {{
   else if (activeFilter === "flag-wrong-colour") brands = brands.filter(b => flagged[b.folder] === "wrong-colour");
   else if (activeFilter === "low") brands = brands.filter(b => b.blending_risk === "LOW");
   else if (activeFilter === "high") brands = brands.filter(b => b.blending_risk === "HIGH");
-  else if (activeFilter === "svg") brands = brands.filter(b => b.is_svg || b.has_svg_file);
+  else if (activeFilter === "svg") brands = brands.filter(b => (b.logo_candidates && b.logo_candidates.some(c => c.is_svg)) || b.is_svg);
   else if (activeFilter === "logoissue") brands = brands.filter(b => b.logo_issues && b.logo_issues.length > 0);
   if (activeCategory !== "all") brands = brands.filter(b => b.category === activeCategory);
   return brands;
@@ -1893,7 +1990,7 @@ function renderGrid() {{
     const recolourHex = logoRecolours[b.folder];
 
     let badges = `<span class="badge ${{rc}}">${{b.blending_risk}}</span> `;
-    if (b.is_svg || b.has_svg_file) badges += `<span class="badge badge-svg">SVG</span> `;
+    if ((b.logo_candidates && b.logo_candidates.some(c => c.is_svg)) || b.is_svg) badges += `<span class="badge badge-svg">SVG</span> `;
     if (b.bg_removed) badges += `<span class="badge badge-rembg">BG Rem</span> `;
     if (b.undersize) badges += `<span class="badge badge-undersize">Upscaled</span> `;
     if (b.logo_issues && b.logo_issues.length) badges += `<span class="badge badge-logoissue" title="${{b.logo_issues.join(', ')}}">!</span> `;
@@ -1954,23 +2051,29 @@ function renderGrid() {{
 // ─── EXPORTS ───
 function _buildExportData() {{
   return BRANDS.filter(b => finalized.has(b.folder)).map(b => {{
-    const selCand = selectedLogos[b.folder] !== undefined ? b.logo_candidates[selectedLogos[b.folder]] : null;
+    const selIdx = selectedLogos[b.folder];
+    const selCand = selIdx !== undefined && b.logo_candidates ? b.logo_candidates[selIdx] : null;
+    const selFile = selCand ? selCand.file : (b.is_svg ? b.folder + "/logo.svg" : b.folder + "/logo.png");
+    const fmt = selCand ? (selCand.is_svg ? "svg" : "png") : (b.is_svg ? "svg" : "png");
     return {{
-      brand_name: b.name, folder: b.folder, category: b.category,
+      brand_name: b.name,
+      folder: b.folder,
+      category: b.category,
       website: b.website || "",
       bg_colour: selectedColours[b.folder] || b.colour,
       logo_recolour: logoRecolours[b.folder] || null,
       meta_description: b.meta_description || "",
-      logo_file: b.folder + "/logo.png",
-      svg_file: b.has_svg_file ? b.folder + "/logo.svg" : null,
-      is_svg: b.is_svg,
-      selected_logo_source: selCand ? selCand.source : b.source,
-      selected_logo_tier: selCand ? selCand.tier : b.tier,
-      source_tier: b.tier, logo_source: b.source,
-      confidence: b.confidence, blending_risk: b.blending_risk,
+      selected_file: selFile,
+      format: fmt,
+      logo_source: b.source,
+      source_tier: b.tier,
+      confidence: b.confidence,
+      blending_risk: b.blending_risk,
       logo_quality_score: b.logo_quality_score,
       logo_issues: b.logo_issues || [],
-      original_size: b.original_size, undersize: b.undersize, bg_removed: b.bg_removed,
+      original_size: b.original_size,
+      undersize: b.undersize,
+      bg_removed: b.bg_removed,
       flag_reason: flagged[b.folder] || null,
     }};
   }});
@@ -2001,24 +2104,48 @@ async function exportZIP() {{
   document.getElementById("exportStatus").textContent = "Building ZIP...";
   const zip = new JSZip();
 
-  // Add data CSV
+  // Add data CSV and JSON
   const flat = data.map(d => ({{ ...d, logo_issues: (d.logo_issues||[]).join("; "), logo_recolour: d.logo_recolour||"" }}));
   const headers = Object.keys(flat[0]);
   const csvStr = [headers.join(","), ...flat.map(r => headers.map(h => `"${{String(r[h]||"").replace(/"/g,'""')}}"`).join(","))].join("\\n");
   zip.file("brand_data.csv", csvStr);
   zip.file("brand_data.json", JSON.stringify(data, null, 2));
 
-  // Add logos — SVG if sourced as SVG, PNG otherwise (never both)
-  for (const b of BRANDS) {{
-    if (!finalized.has(b.folder)) continue;
+  // Add logos sorted by flag status
+  for (const d of data) {{
+    const b = BRANDS.find(x => x.folder === d.folder);
+    if (!b) continue;
+    const selIdx = selectedLogos[b.folder];
+    const selCand = selIdx !== undefined && b.logo_candidates ? b.logo_candidates[selIdx] : null;
+
+    // Determine flag folder
+    let flagFolder = "final";
+    const reason = flagged[b.folder];
+    if (reason === "wrong-logo") flagFolder = "flagged_wrong_logo";
+    else if (reason === "needs-upscaling") flagFolder = "flagged_needs_upscaling";
+    else if (reason === "wrong-colour") flagFolder = "flagged_wrong_colour";
+    else if (reason === "other") flagFolder = "flagged_other";
+
     const safeName = b.name.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\\s+/g, "_");
-    const svgMarkup = _getActiveSvgMarkup(b);
-    if (svgMarkup) {{
-      zip.file(`logos/${{safeName}}.svg`, svgMarkup);
-    }} else {{
-      const logoSrc = getActiveLogo(b);
-      if (logoSrc) {{
-        zip.file(`logos/${{safeName}}.png`, logoSrc, {{base64: true}});
+    const isSelSvg = selCand ? selCand.is_svg : b.is_svg;
+    const ext = isSelSvg ? "svg" : "png";
+
+    if (isSelSvg && selCand && selCand.svg_markup) {{
+      // SVG with potential recolour
+      let svgMarkup = selCand.svg_markup;
+      const rcHex = logoRecolours[b.folder];
+      if (rcHex) {{
+        svgMarkup = _applyRecolour(svgMarkup, rcHex);
+      }}
+      zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, svgMarkup);
+    }} else if (selCand && selCand.file) {{
+      // PNG - fetch from candidates folder
+      try {{
+        const resp = await fetch(b.folder + "/" + selCand.file);
+        const blob = await resp.blob();
+        zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, blob);
+      }} catch (e) {{
+        console.warn(`Failed to fetch ${{selCand.file}}:`, e);
       }}
     }}
   }}
@@ -2119,28 +2246,22 @@ def process_brand(brand_name: str, website: str,
             if svg_raw:
                 cand["svg_data"] = svg_raw
             logo_candidates.append(cand)
-            if not MULTI_CANDIDATES:
-                logo_data = cand
-                result["source_tier"] = 0
 
     # ── TIERS 1-8 ────────────────────────────────────────────────────────────
     for tier_num, tier_name, tier_fn in tier_funcs[1:]:
-        if not MULTI_CANDIDATES and logo_data:
-            break  # already found one, stop (classic mode)
-        if len(logo_candidates) >= 5 and MULTI_CANDIDATES:
-            break  # enough candidates
+        if len(logo_candidates) >= CANDIDATE_CAP:
+            break  # hard cap on candidates
         try:
             td = tier_fn()
         except Exception as e:
-            print(f"  [tier{tier_num}] {tier_name} error: {e}", flush=True)
+            log.debug(f"[tier{tier_num}] {tier_name} error: {e}")
             td = None
         if not td:
             # Debug: tier returned nothing
             pass  # individual tier functions already print warnings
         if td:
-            # A tier can return a single dict or a list of dicts (multi mode)
+            # A tier can return a single dict or a list of dicts
             td_list = td if isinstance(td, list) else [td]
-            first_cand = None
             for td_item in td_list:
                 cand = {
                     "tier": tier_num, "tier_name": tier_name,
@@ -2155,11 +2276,27 @@ def process_brand(brand_name: str, website: str,
                 if td_item.get("si_colour"):
                     cand["si_colour"] = td_item["si_colour"]
                 logo_candidates.append(cand)
-                if first_cand is None:
-                    first_cand = cand
-            if not logo_data:
-                logo_data = first_cand
-                result["source_tier"] = tier_num
+
+    # ── Pick suggested primary by priority ──────────────────────────────────
+    if logo_candidates:
+        # 1. Highest-confidence SVG candidate
+        # 2. Highest-confidence raster with transparency
+        # 3. Highest-confidence raster without transparency
+        # 4. Whatever was found
+        svg_candidates = [c for c in logo_candidates if c.get("is_svg")]
+        rasters = [c for c in logo_candidates if not c.get("is_svg") and c["image"]]
+        raster_with_alpha = [c for c in rasters if has_transparency(c["image"])]
+        raster_without_alpha = [c for c in rasters if not has_transparency(c["image"])]
+
+        if svg_candidates:
+            logo_data = max(svg_candidates, key=lambda x: x.get("confidence", 0))
+        elif raster_with_alpha:
+            logo_data = max(raster_with_alpha, key=lambda x: x.get("confidence", 0))
+        elif raster_without_alpha:
+            logo_data = max(raster_without_alpha, key=lambda x: x.get("confidence", 0))
+        else:
+            logo_data = logo_candidates[0]
+        result["source_tier"] = logo_data["tier"]
 
     if not logo_data:
         result["errors"].append("No logo found in any tier")
@@ -2172,6 +2309,16 @@ def process_brand(brand_name: str, website: str,
     result["logo_source"] = logo_data["source"]
     result["logo_url"] = logo_data.get("url")
     result["is_svg"] = logo_data.get("is_svg", False)
+
+    # For SVG primaries, temp-rasterize for analysis only
+    if result["is_svg"] and raw_img is None:
+        svg_bytes = logo_data.get("svg_data")
+        if svg_bytes:
+            raw_img = _svg_to_pil(svg_bytes, TARGET_SIZE)
+            if not raw_img:
+                result["errors"].append("Could not rasterize SVG for analysis")
+                return result
+
     result["has_transparency"] = bool(has_transparency(raw_img))
     result["original_size"] = f"{raw_img.width}x{raw_img.height}"
 
@@ -2251,47 +2398,73 @@ def process_brand(brand_name: str, website: str,
     brand_dir.mkdir(parents=True, exist_ok=True)
 
     processed.save(brand_dir / "logo.png")
-    logo_data["image"].save(brand_dir / "logo_raw.png")
 
-    # Save SVG if we have it
+    # Save raw image only if we have a raster primary
+    if logo_data["image"]:
+        logo_data["image"].save(brand_dir / "logo_raw.png")
+
+    # Save SVG if we have it (for SVG primaries, also save as logo.svg)
     if logo_data.get("svg_data"):
-        (brand_dir / "logo.svg").write_bytes(logo_data["svg_data"])
+        squared_svg = make_svg_square(logo_data["svg_data"])
+        (brand_dir / "logo.svg").write_bytes(squared_svg)
 
-    # Save logo candidates (for multi-candidate mode)
+    # Save all logo candidates to candidates/ subfolder
+    candidates_dir = brand_dir / "candidates"
+    candidates_dir.mkdir(exist_ok=True)
+
     saved_candidates = []
     for idx, cand in enumerate(logo_candidates):
+        # Sanitize source name for filename
+        source_slug = re.sub(r'[^a-z0-9_\-]', '_', cand["source"].lower())
+        is_svg = cand.get("is_svg", False)
+
         cand_info = {
             "index": idx,
             "tier": cand["tier"],
             "tier_name": cand["tier_name"],
             "source": cand["source"],
             "url": cand.get("url", ""),
-            "is_svg": cand.get("is_svg", False),
+            "is_svg": is_svg,
             "confidence": cand.get("confidence", 0.5),
-            "size": f"{cand['image'].width}x{cand['image'].height}",
             "is_selected": (cand is logo_data),
         }
-        # Save candidate thumbnail as base64 in meta (for HTML)
-        try:
-            thumb = cand["image"].copy()
-            thumb.thumbnail((200, 200), Image.LANCZOS)
+
+        # Save candidate file
+        if is_svg and cand.get("svg_data"):
+            # SVG candidate: apply make_svg_square() and save
+            svg_data = cand["svg_data"]
+            squared_svg = make_svg_square(svg_data)
+            filename = f"{idx:02d}_{source_slug}.svg"
+            filepath = candidates_dir / filename
+            filepath.write_bytes(squared_svg)
+            cand_info["file"] = f"candidates/{filename}"
+            cand_info["size"] = "vector"
+
+            # Create thumbnail by rasterizing the SVG
+            thumb_img = _svg_to_pil(squared_svg, 400)
+            if thumb_img:
+                buf = BytesIO()
+                thumb_img.save(buf, format="PNG")
+                cand_info["thumb_b64"] = base64.b64encode(buf.getvalue()).decode()
+        elif cand.get("image"):
+            # Raster candidate: apply process_logo() and save
+            raster_img = cand["image"].copy()
+            processed_raster = process_logo(raster_img)
+            filename = f"{idx:02d}_{source_slug}.png"
+            filepath = candidates_dir / filename
+            processed_raster.save(filepath)
+            cand_info["file"] = f"candidates/{filename}"
+            cand_info["size"] = f"{processed_raster.width}x{processed_raster.height}"
+
+            # Create thumbnail
+            thumb = processed_raster.copy()
+            thumb.thumbnail((400, 400), Image.LANCZOS)
             if thumb.mode != "RGBA":
                 thumb = thumb.convert("RGBA")
             buf = BytesIO()
             thumb.save(buf, format="PNG")
             cand_info["thumb_b64"] = base64.b64encode(buf.getvalue()).decode()
-        except Exception:
-            cand_info["thumb_b64"] = ""
-        # Save candidate SVG data if present
-        if cand.get("svg_data"):
-            try:
-                raw_svg = cand["svg_data"]
-                if isinstance(raw_svg, bytes):
-                    raw_svg = raw_svg.decode("utf-8", errors="replace")
-                if "<svg" in raw_svg.lower() and len(raw_svg) < 200_000:
-                    cand_info["svg_markup"] = raw_svg
-            except Exception:
-                pass
+
         saved_candidates.append(cand_info)
 
     result["logo_candidates"] = saved_candidates
@@ -2303,7 +2476,7 @@ def process_brand(brand_name: str, website: str,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Brand Asset Pipeline v4")
+    parser = argparse.ArgumentParser(description="Brand Asset Pipeline v6")
     parser.add_argument("--input", required=True, help="Input CSV file")
     parser.add_argument("--sample", type=int, default=0, help="Number of brands to sample (0=all)")
     parser.add_argument("--output", default="./brand_assets", help="Output directory")
@@ -2312,18 +2485,20 @@ def main():
                         help="Background removal model (default: u2net)")
     parser.add_argument("--alpha-matting", action="store_true",
                         help="Enable alpha matting for cleaner edges (slower)")
-    parser.add_argument("--multi", action="store_true",
-                        help="Collect up to 5 logo candidates per brand from multiple tiers (slower, but offers choices)")
     parser.add_argument("--threads", type=int, default=1,
                         help="Number of parallel threads (default: 1, recommended: 4)")
+    parser.add_argument("--log-level", default="info", choices=["info", "debug"],
+                        help="Log level: info (clean terminal) or debug (verbose)")
     args = parser.parse_args()
 
-    global OUT_DIR, REMBG_MODEL, ALPHA_MATTING, MULTI_CANDIDATES
+    global OUT_DIR, REMBG_MODEL, ALPHA_MATTING
     OUT_DIR = Path(args.output)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     REMBG_MODEL = args.rembg_model
     ALPHA_MATTING = args.alpha_matting
-    MULTI_CANDIDATES = args.multi
+
+    # Setup logging — file handler needs the output directory
+    _setup_file_logging(OUT_DIR, args.log_level)
 
     # Read CSV
     with open(args.input) as f:
@@ -2335,24 +2510,25 @@ def main():
         rows = random.sample(rows, args.sample)
 
     print(f"\n{'='*60}")
-    print(f"  Brand Asset Pipeline v4 — Processing {len(rows)} brands")
+    print(f"  Brand Asset Pipeline v6 — Processing {len(rows)} brands")
     print(f"  Output:  {OUT_DIR.absolute()}")
     print(f"  Model:   {REMBG_MODEL}  |  Alpha matting: {'ON' if ALPHA_MATTING else 'OFF'}")
-    svg_status = "\u2705 cairosvg installed" if HAS_CAIROSVG else "\u26a0\ufe0f  cairosvg NOT installed — SVGs will be saved but not rasterized"
-    print(f"  SVG:     {svg_status}")
-    multi_str = f"  Multi:   ON (up to 5 candidates per brand)" if MULTI_CANDIDATES else "  Multi:   OFF (first match wins)"
-    print(multi_str)
+    svg_status = "\u2705 cairosvg" if HAS_CAIROSVG else "\u26a0\ufe0f  cairosvg NOT installed"
+    pw_status = "\u2705 playwright" if HAS_PLAYWRIGHT else "\u26a0\ufe0f  playwright NOT installed"
+    print(f"  Deps:    {svg_status}  |  {pw_status}")
+    print(f"  Mode:    All tiers, up to {CANDIDATE_CAP} candidates per brand")
     if args.threads > 1:
         print(f"  Threads: {args.threads}")
+    print(f"  Log:     {OUT_DIR / 'pipeline.log'}")
     print(f"{'='*60}\n")
-    if not HAS_CAIROSVG:
-        print("  TIP: Install cairosvg for SVG support:  brew install cairo && pip install cairosvg\n")
 
     results = []
-    tier_counts = Counter()
+    tier_counts = Counter()  # counts how many brands each tier was the PRIMARY source for
+    tier_candidate_counts = Counter()  # counts total candidates from each tier
     status_counts = Counter()
 
     # Auto-detect CSV column names
+    col_name, col_site, col_logo, col_color = "", "", "", ""
     if rows:
         cols = list(rows[0].keys())
         col_name = next((c for c in cols if c.lower() in ("brand_name", "name", "brand")), cols[0])
@@ -2381,13 +2557,14 @@ def main():
         with print_lock:
             completed[0] += 1
             n = completed[0]
+            cand_count = result.get("logo_candidates_count", 0)
             if result["status"] == "success":
-                risk = result.get("blending_risk", "")
-                emoji = "\u2705" if risk == "LOW" else ("\u26a0\ufe0f " if risk == "MEDIUM" else "\U0001f534")
-                svg_tag = " [SVG]" if result.get("is_svg") else ""
-                size_tag = " [UNDERSIZE]" if result.get("undersize") else ""
-                cands_tag = f" [{result.get('logo_candidates_count', 1)} opts]" if MULTI_CANDIDATES else ""
-                print(f"[{n:3d}/{len(work_items)}] {name:35s} {emoji}  T{result['source_tier']}  {result['brand_colour']}  conf={result['confidence']}{svg_tag}{size_tag}{cands_tag}")
+                # Count PNG vs SVG candidates
+                cands = result.get("logo_candidates", [])
+                svg_c = sum(1 for c in cands if c.get("is_svg"))
+                png_c = len(cands) - svg_c
+                emoji = "\u2705" if cand_count >= 3 else ("\u26a0\ufe0f " if cand_count >= 1 else "\U0001f534")
+                print(f"[{n:3d}/{len(work_items)}] {name:35s} {emoji}  {cand_count} candidates ({png_c} PNG, {svg_c} SVG)")
             else:
                 print(f"[{n:3d}/{len(work_items)}] {name:35s} \u274c  {result['errors'][:1]}")
         return result
@@ -2405,6 +2582,9 @@ def main():
         status_counts[result["status"]] += 1
         if result.get("source_tier") is not None:
             tier_counts[f"tier{result['source_tier']}"] += 1
+        # Count all candidates per tier
+        for cand in result.get("logo_candidates", []):
+            tier_candidate_counts[f"tier{cand['tier']}"] += 1
 
     # ── Summary ──────────────────────────────────────────────────────────────
     tier_names = {
@@ -2419,20 +2599,18 @@ def main():
     print(f"  Success:    {status_counts.get('success', 0)}")
     print(f"  Failed:     {status_counts.get('failed', 0)}")
 
-    print(f"\n  Source effectiveness:")
-    print(f"  {'Tier':<6} {'Source':<18} {'Hits':>5}  {'Bar':<20} {'Status'}")
+    total_candidates = sum(tier_candidate_counts.values())
+    print(f"  Total candidates sourced: {total_candidates}")
+
+    print(f"\n  Source effectiveness (primary selected / total candidates from tier):")
+    print(f"  {'Tier':<6} {'Source':<18} {'Primary':>7}  {'Cands':>7}  {'Bar':<20}")
     print(f"  {'-'*70}")
     for t in range(9):
-        count = tier_counts.get(f"tier{t}", 0)
+        primary = tier_counts.get(f"tier{t}", 0)
+        cands = tier_candidate_counts.get(f"tier{t}", 0)
         name = tier_names.get(t, f"Tier {t}")
-        bar = "\u2588" * min(count, 40)
-        if count == 0:
-            status = "\u274c  ZERO HITS — consider removing"
-        elif count < 3:
-            status = "\u26a0\ufe0f  low yield"
-        else:
-            status = "\u2705"
-        print(f"  T{t:<5} {name:<18} {count:>5}  {bar:<20} {status}")
+        bar = "\u2588" * min(cands, 40)
+        print(f"  T{t:<5} {name:<18} {primary:>7}  {cands:>7}  {bar:<20}")
 
     svg_count = sum(1 for r in results if r.get("is_svg"))
     undersize_count = sum(1 for r in results if r.get("undersize"))
@@ -2441,7 +2619,7 @@ def main():
     logo_issues = [r for r in results if r.get("logo_issues")]
 
     print(f"\n  Quality indicators:")
-    print(f"    SVG logos found:      {svg_count}")
+    print(f"    SVG primary selected: {svg_count}")
     print(f"    Undersize (<500px):   {undersize_count}")
     print(f"    BG removed (rembg):   {bg_removed}")
     print(f"    High blending risk:   {len(high_risk)}")
@@ -2454,11 +2632,6 @@ def main():
         for cat, cnt in cat_counts.most_common():
             print(f"    {cat:<24} {cnt}")
 
-    if high_risk:
-        print(f"\n  Brands with HIGH blending risk:")
-        for r in high_risk[:10]:
-            print(f"    - {r['brand_name']}: {r['brand_colour']}")
-
     # Save summary JSON
     with open(OUT_DIR / "pipeline_summary.json", "w") as f:
         json.dump(results, f, indent=2, cls=SafeEncoder, default=str)
@@ -2469,12 +2642,11 @@ def main():
             "brand_name", "status", "source_tier", "logo_source", "is_svg",
             "brand_colour", "colour_source", "colour_candidates", "blending_risk",
             "has_transparency", "bg_removed", "undersize", "original_size",
-            "confidence", "logo_url"
+            "confidence", "logo_url", "logo_candidates_count",
         ])
         w.writeheader()
         for r in results:
             row = {k: r.get(k) for k in w.fieldnames}
-            # Stringify candidates list for CSV
             if isinstance(row.get("colour_candidates"), list):
                 row["colour_candidates"] = " | ".join(
                     f"{c['hex']}({c.get('source','?')})" for c in row["colour_candidates"]
@@ -2492,6 +2664,7 @@ def main():
     print(f"\n  \U0001f4c1 Assets saved to: {OUT_DIR.absolute()}")
     print(f"  \U0001f310 Review page:    open {OUT_DIR / 'review.html'}")
     print(f"  \U0001f4cb Review CSV:      {OUT_DIR / 'review.csv'}")
+    print(f"  \U0001f4d3 Debug log:       {OUT_DIR / 'pipeline.log'}")
     print(f"{'='*60}\n")
 
 
