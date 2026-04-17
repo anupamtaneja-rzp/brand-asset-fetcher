@@ -16,7 +16,7 @@ Built for Razorpay's reward catalogue — takes a CSV of brand names, outputs pr
 ```bash
 pip install requests beautifulsoup4 Pillow scikit-learn numpy rembg onnxruntime cairosvg
 
-# Run pipeline + auto-open review page
+# Run pipeline + auto-open review page (always use --threads 4)
 python brand_asset_pipeline.py --input brands.csv --output batch_1_assets --threads 4
 
 # Resume review later (no re-scraping)

@@ -43,7 +43,7 @@ python -m playwright install chromium
 ### 2. Run the pipeline
 ```bash
 source brand_env/bin/activate
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets
+python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --threads 4
 ```
 
 The pipeline sources logos, processes them, generates the review page, and auto-opens it at `http://localhost:4200/review.html`. Press `Ctrl+C` to stop the server when done.
