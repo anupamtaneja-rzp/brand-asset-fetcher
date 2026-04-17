@@ -2676,9 +2676,51 @@ def process_brand(brand_name: str, website: str,
     return result
 
 
+def _start_review_server(directory: Path, port: int = 4200):
+    """Start a local HTTP server and open the review page in the default browser."""
+    import http.server
+    import socketserver
+    import webbrowser
+    import threading
+
+    os.chdir(directory)
+
+    handler = http.server.SimpleHTTPRequestHandler
+    # Suppress request logs cluttering the terminal
+    handler.log_message = lambda *args, **kwargs: None
+
+    try:
+        httpd = socketserver.TCPServer(("", port), handler)
+    except OSError:
+        # Port in use — try next few ports
+        for p in range(port + 1, port + 10):
+            try:
+                httpd = socketserver.TCPServer(("", p), handler)
+                port = p
+                break
+            except OSError:
+                continue
+        else:
+            print(f"  Could not find open port near {port}. Open review.html manually.")
+            return
+
+    url = f"http://localhost:{port}/review.html"
+    print(f"\n  Serving review at {url}")
+    print(f"  Press Ctrl+C to stop the server\n")
+
+    # Open browser after a short delay so server is ready
+    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Server stopped.")
+        httpd.shutdown()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Brand Asset Pipeline v6")
-    parser.add_argument("--input", required=True, help="Input CSV file")
+    parser.add_argument("--input", help="Input CSV file")
     parser.add_argument("--sample", type=int, default=0, help="Number of brands to sample (0=all)")
     parser.add_argument("--output", default="./brand_assets", help="Output directory")
     parser.add_argument("--rembg-model", default="u2net",
@@ -2690,7 +2732,27 @@ def main():
                         help="Number of parallel threads (default: 1, recommended: 4)")
     parser.add_argument("--log-level", default="info", choices=["info", "debug"],
                         help="Log level: info (clean terminal) or debug (verbose)")
+    parser.add_argument("--serve", action="store_true",
+                        help="Start review server only (no pipeline run). Use with --output to point to existing results.")
+    parser.add_argument("--no-serve", action="store_true",
+                        help="Skip auto-starting the review server after pipeline run")
+    parser.add_argument("--port", type=int, default=4200,
+                        help="Port for the review server (default: 4200)")
     args = parser.parse_args()
+
+    # --serve mode: just start the server, no pipeline
+    if args.serve:
+        out = Path(args.output)
+        if not (out / "review.html").exists():
+            print(f"  Error: {out / 'review.html'} not found. Run the pipeline first or check --output path.")
+            sys.exit(1)
+        _start_review_server(out, args.port)
+        return
+
+    # Normal pipeline mode: --input is required
+    if not args.input:
+        parser.error("--input is required (unless using --serve)")
+
 
     global OUT_DIR, REMBG_MODEL, ALPHA_MATTING
     OUT_DIR = Path(args.output)
@@ -2863,10 +2925,16 @@ def main():
         print(f"  \u26a0\ufe0f  No results — skipped review page")
 
     print(f"\n  \U0001f4c1 Assets saved to: {OUT_DIR.absolute()}")
-    print(f"  \U0001f310 Review page:    open {OUT_DIR / 'review.html'}")
     print(f"  \U0001f4cb Review CSV:      {OUT_DIR / 'review.csv'}")
     print(f"  \U0001f4d3 Debug log:       {OUT_DIR / 'pipeline.log'}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+
+    # Auto-start review server unless --no-serve
+    if not args.no_serve and html_path:
+        _start_review_server(OUT_DIR, args.port)
+    elif html_path:
+        print(f"\n  To review later:  python brand_asset_pipeline.py --serve --output {OUT_DIR}")
+        print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":

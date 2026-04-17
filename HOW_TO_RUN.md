@@ -3,122 +3,113 @@
 ## What you'll get
 A folder (e.g. `batch_1_assets/`) with:
 - **Each brand's folder** containing a `candidates/` subfolder with ALL sourced logos (PNG and SVG, full quality, square format)
-- **review.html** — interactive review page: pick the best logo per brand, recolour SVGs, flag issues, export
+- **review.html** — interactive review page served at `localhost:4200`: pick the best logo per brand, recolour SVGs, flag issues, save/load sessions, export
 - **review.csv** — spreadsheet with colours, confidence scores, blending risks
 - **pipeline_summary.json** — full processing results
 - **pipeline.log** — detailed debug log (fetch errors, HTTP statuses, tier diagnostics)
 
 ### What changed in v6
-- **All candidates saved as files** — every logo option from every tier is saved at full quality in `candidates/` subfolder. Not just the primary.
-- **No more classic mode** — `--multi` flag removed. Every run sources from ALL 9 tiers automatically (up to 50 candidates per brand).
-- **SVGs preserved as vectors** — SVGs are never rasterized for output. They're saved with a square viewBox. Rasterization only happens for preview thumbnails.
-- **No downsizing** — images are never shrunk. A 1200px logo stays 1200px. Only upscaled if below 500px.
-- **SVG recolouring** — recolour SVG logos directly (in the review UI or via Python).
-- **Flag-aware export** — flagged brands get sorted into folders (`flagged_wrong_logo/`, `flagged_needs_upscaling/`, etc.) so engineering knows what needs attention.
+- **All candidates saved as files** — every logo option from every tier is saved at full quality in `candidates/` subfolder
+- **No more classic mode** — every run sources from ALL 9 tiers automatically (up to 50 candidates per brand)
+- **SVGs preserved as vectors** — SVGs are never rasterized for output. Saved with square viewBox. Rasterization only for preview thumbnails.
+- **No downsizing** — images are never shrunk. Only upscaled if below 500px.
+- **SVG recolouring** — recolour SVG logos in the review UI. Baked into the file on export.
+- **Flag-aware export** — flagged brands sorted into folders (`flagged_wrong_logo/`, etc.)
+- **Reward Catalogue CSV** — export CSV matches the bulk creation template format
+- **Save/Load sessions** — save your review progress to a JSON file. Resume anytime.
+- **Local review server** — auto-starts after pipeline run. Full-quality exports work out of the box.
+- **Remaining brands** — export includes a `remaining_brands.csv` listing everything not finalized
+- **Improved SVG detection** — inline SVGs found via `<title>` matching, aria-label, and SPA framework detection (Remix, Gatsby, Next.js, Nuxt)
 - **Clean terminal** — progress shows candidate counts. All debug output goes to `pipeline.log`.
-- **Priority: SVG > transparent raster > opaque raster** — the pipeline suggests the best candidate using this priority.
 
 ---
 
-## Step-by-step
+## Quick start
 
-### Step 1: Open Terminal
-Press `Cmd + Space`, type **Terminal**, hit Enter.
-
----
-
-### Step 2: Go to wherever you saved the files
-```
-cd ~/Desktop
-```
-
----
-
-### Step 3: Files you need
-- `brand_asset_pipeline.py` (the script)
-- `batch_1_brands.csv` (or any batch file)
-
----
-
-### Step 4: Create a virtual environment (one time only)
-```
+### 1. Install (one time)
+```bash
+# Create virtual environment
 python3 -m venv brand_env
-```
-
----
-
-### Step 5: Activate the virtual environment
-```
 source brand_env/bin/activate
-```
-You need to run this every time you open a new Terminal window.
 
----
-
-### Step 6: Install Python packages (one time only)
-```
+# Install dependencies
 pip install requests beautifulsoup4 Pillow scikit-learn numpy rembg onnxruntime cairosvg
-```
 
-**Optional — Playwright for SPA sites** (recommended):
-```
+# Optional — Playwright for SPA sites (recommended)
 pip install playwright
 python -m playwright install chromium
 ```
 
----
-
-### Step 7: Run a batch
-
-**Standard run (sequential):**
-```
+### 2. Run the pipeline
+```bash
+source brand_env/bin/activate
 python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets
 ```
 
-**Faster run (parallel):**
-```
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --threads 4
-```
+The pipeline sources logos, processes them, generates the review page, and auto-opens it at `http://localhost:4200/review.html`. Press `Ctrl+C` to stop the server when done.
 
-**Debug mode (verbose terminal output):**
+### 3. Resume a previous review session
+```bash
+python brand_asset_pipeline.py --serve --output batch_1_assets
 ```
-python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_assets --threads 4 --log-level debug
-```
-
-**What happens:**
-- Progress line for each brand showing candidate count and format breakdown
-- Console symbols: ✅ = 3+ candidates, ⚠️ = 1-2 candidates, ❌ = no candidates found
-- At the end: source effectiveness table showing both primary picks and total candidates per tier
-- All debug info written to `pipeline.log` in the output folder
+Opens the review page without re-running the pipeline. Click **Load Session** to restore your saved progress.
 
 ---
 
-### Step 8: Open the review page
+## Run options
+
+**Standard run:**
+```bash
+python brand_asset_pipeline.py --input brands.csv --output batch_1_assets
 ```
-open batch_1_assets/review.html
+
+**Parallel (faster):**
+```bash
+python brand_asset_pipeline.py --input brands.csv --output batch_1_assets --threads 4
+```
+
+**Debug mode (verbose terminal):**
+```bash
+python brand_asset_pipeline.py --input brands.csv --output batch_1_assets --log-level debug
+```
+
+**Custom port:**
+```bash
+python brand_asset_pipeline.py --input brands.csv --output batch_1_assets --port 8080
+```
+
+**Skip auto-server (just generate files):**
+```bash
+python brand_asset_pipeline.py --input brands.csv --output batch_1_assets --no-serve
+```
+
+**Resume review only:**
+```bash
+python brand_asset_pipeline.py --serve --output batch_1_assets
 ```
 
 ---
 
 ## Using the review page
 
-### Grid view (default)
+### Grid view
 - **Shape toggle**: Square / Circle / Card
 - **Size slider**: make cards bigger or smaller
 - **Sort by**: Name, Confidence, Blending Risk, Source Tier, Category
 - **Category filter**: dropdown to show one category at a time
 - **Filter buttons**: All / Finalized / Pending / Flagged / Wrong Logo / Needs Upscaling / Wrong Colour / Low risk / High risk / SVG / Logo issues
 - **Colour swatches** on each card: click to change background colour
-- **Mark as Final** button
-- **Flag** button — choose a flag reason
+- **Mark as Final** and **Flag** buttons
 
-### Expanded detail view (click any card)
-- **Larger logo preview** with selected background
-- **Logo picker** — all candidates shown with source, tier, format (SVG/PNG badge), dimensions, confidence. Click to switch.
-- **SVG recolour** — for SVG logos, pick any colour. Applied directly to the SVG.
+### Detail view (click any card)
+- **Logo picker** — all candidates with source, tier, format (SVG/PNG), dimensions, confidence. Click to switch.
+- **SVG recolour** — for SVG logos, pick any colour. Baked into the export.
 - **Background colour swatches**
-- **Source info** — tier, URL, dimensions
-- **Website link**
+- **Source info**, website link, quality metrics
+
+### Save / Load session
+- **Save Session** — downloads `review_session.json` with all your decisions (finalized, flagged, selected logos, recolours, colours)
+- **Load Session** — pick a previously saved JSON to restore all state
 
 ### Flag reasons
 | Flag | Use when... |
@@ -129,16 +120,39 @@ open batch_1_assets/review.html
 | Other | Any other issue |
 
 ### Exporting
-- **Export JSON / CSV** — finalized brands with metadata (includes flag_reason, selected_file, format)
+- **Export CSV** — Reward Catalogue format (15 standard columns + pipeline internal columns)
+- **Export JSON** — same data, structured
 - **Export ZIP** — the key handoff artifact:
-  - `final/` — unflagged finalized brands (one file each, full quality)
-  - `flagged_wrong_logo/` — flagged but finalized
-  - `flagged_needs_upscaling/` — flagged but finalized
-  - `flagged_wrong_colour/` — flagged but finalized
-  - `flagged_other/` — flagged but finalized
-  - `brand_data.csv` + `brand_data.json`
-  - SVGs with recolour baked in if you set one
-  - Engineering gets: `final/` = ready to ship, `flagged_*/` = needs attention
+  - `final/` — unflagged finalized brands (one logo each, full quality)
+  - `flagged_wrong_logo/`, `flagged_needs_upscaling/`, `flagged_wrong_colour/`, `flagged_other/` — flagged but finalized
+  - `brand_data.csv` — Reward Catalogue format for bulk upload
+  - `brand_data.json` — structured version
+  - `remaining_brands.csv` — all non-finalized brands with status and errors
+  - SVGs have recolour baked in if you set one
+
+---
+
+## Export CSV format (Reward Catalogue)
+
+| Column | Source |
+|--------|--------|
+| `category_display_name` | Scraped from website |
+| `brand_name` | From input CSV |
+| `brand_description` | Scraped meta description |
+| `brand_url` | From input CSV |
+| `brand_logo_url` | Filename of exported asset (e.g. `Saregama.svg`) |
+| `brand_background_colour` | Reviewer's selected hex |
+| `reward_display_name` | Same as brand_name |
+| `offer_redemption_channel` | Empty (ops fills in) |
+| `offer_redemption_url` | Same as brand_url |
+| `reward_image_url` | Empty (separate featured image) |
+| `reward_bgcolor_code` | Same as brand_background_colour |
+| `translation_short_description` | Scraped meta description |
+| `translation_description` | Empty (ops writes) |
+| `translation_how_to_redeem` | Empty (ops writes) |
+| `translation_terms_and_conditions` | Empty (ops writes) |
+
+Pipeline internal columns appended after: `flag_reason`, `logo_format`, `logo_recolour`, `source_tier`, `confidence`, `blending_risk`, `logo_quality_score`, `logo_issues`, `original_size`, `undersize`, `bg_removed`.
 
 ---
 
@@ -148,13 +162,13 @@ open batch_1_assets/review.html
 batch_1_assets/
   saregama/
     candidates/
-      00_brandfetch_logodev.png        # full quality, square
-      01_website_svg-link.svg          # square viewBox SVG
-      02_website_apple-touch-icon.png  # full quality, square
-      03_simpleicons_svg.svg           # square viewBox SVG
-    logo.png                           # primary (processed)
-    logo.svg                           # primary SVG (if applicable)
-    meta.json                          # all metadata + candidate file refs
+      00_brandfetch_logodev.png
+      01_website_svg-link.svg
+      02_website_apple-touch-icon.png
+      03_simpleicons_svg.svg
+    logo.png
+    logo.svg
+    meta.json
   another_brand/
     candidates/
       ...
@@ -171,13 +185,16 @@ batch_1_assets/
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input FILE` | (required) | Input CSV file |
+| `--input FILE` | (required*) | Input CSV file (*not needed with `--serve`) |
 | `--output DIR` | `./brand_assets` | Output directory |
-| `--sample N` | `0` (all) | Process N random brands (0 = all rows) |
+| `--sample N` | `0` (all) | Process N random brands |
 | `--threads N` | `1` | Parallel threads (recommended: 4) |
 | `--rembg-model MODEL` | `u2net` | BG removal model |
 | `--alpha-matting` | off | Cleaner edges on BG removal (slower) |
-| `--log-level LEVEL` | `info` | `info` = clean terminal, `debug` = verbose |
+| `--log-level LEVEL` | `info` | `info` = clean, `debug` = verbose |
+| `--serve` | off | Start review server only (no pipeline) |
+| `--no-serve` | off | Skip auto-server after pipeline run |
+| `--port N` | `4200` | Port for the review server |
 
 ---
 
@@ -196,8 +213,6 @@ batch_1_assets/
 | 7 | Seeklogo.com | Search + scrape |
 | 8 | Simple Icons | CDN (3000+ SVGs) |
 
-Every tier runs for every brand. All results saved as candidates. Pipeline suggests the best one using priority: SVG > transparent raster > opaque raster.
-
 ---
 
 ## Troubleshooting
@@ -206,13 +221,19 @@ Every tier runs for every brand. All results saved as candidates. Pipeline sugge
 Install Python: https://www.python.org/downloads/
 
 **"No module named rembg"**
-Activate venv first: `source brand_env/bin/activate`, then run Step 6 again.
+Activate venv first: `source brand_env/bin/activate`, then install again.
+
+**Port 4200 already in use**
+The server auto-tries the next few ports. Or use `--port 8080`.
 
 **Where are the debug logs?**
-Check `pipeline.log` in the output folder. All fetch errors, HTTP statuses, and tier diagnostics are there.
+Check `pipeline.log` in the output folder.
 
 **Script is slow**
-First brand takes longer (downloading the AI model). Use `--threads 4` to speed up. Each brand now runs all tiers (more thorough but slower than v5's classic mode).
+First brand takes longer (downloading the AI model). Use `--threads 4`. Each brand runs all 9 tiers.
 
 **cairosvg install fails**
-Try: `brew install cairo` first, then `pip install cairosvg`. Without it, SVGs will be saved but won't get preview thumbnails in the HTML.
+Try: `brew install cairo` first, then `pip install cairosvg`.
+
+**Export ZIP has thumbnails instead of full-quality images**
+Make sure the review page is served via `localhost` (not opened as a local file). The pipeline auto-starts the server, but if you opened `review.html` directly, re-open via `--serve`.
