@@ -455,14 +455,23 @@ def tier2_website_scrape(website_url: str) -> dict | None:
     _logo_containers = soup.find_all(
         lambda tag: tag.name in ("header", "nav", "a", "div", "span")
         and any("logo" in (v if isinstance(v, str) else " ".join(v)).lower()
-                for attr in ["class", "id", "aria-label"]
+                for attr in ["class", "id", "aria-label", "alt", "title"]
                 for v in [tag.get(attr, "")] if v)
     )
-    # Also check direct <svg> children of <a> tags with logo-ish hrefs
+    # Also check <a> tags with homepage-ish hrefs (logo is often the home link)
     for a_tag in soup.find_all("a", href=True):
         href = a_tag.get("href", "")
-        if href in ("/", website_url) or "home" in href.lower():
-            _logo_containers.append(a_tag)
+        aria = (a_tag.get("aria-label") or "").lower()
+        if href in ("/", website_url) or "home" in href.lower() or "home" in aria:
+            if a_tag not in _logo_containers:
+                _logo_containers.append(a_tag)
+    # Check SVGs with <title> containing "logo" anywhere on the page
+    for svg_el in soup.find_all("svg"):
+        title_el = svg_el.find("title")
+        if title_el and title_el.string and "logo" in title_el.string.lower():
+            parent = svg_el.parent
+            if parent and parent not in _logo_containers:
+                _logo_containers.append(parent)
     for container in _logo_containers:
         svg_el = container.find("svg")
         if svg_el and not _inline_svg_bytes:
@@ -472,8 +481,10 @@ def tier2_website_scrape(website_url: str) -> dict | None:
                 if "xmlns" not in svg_str:
                     svg_str = svg_str.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
                 svg_bytes = svg_str.encode("utf-8")
+                # Boost confidence if the SVG has a <title> with "logo"
+                conf = 0.92 if (svg_el.find("title") and "logo" in (svg_el.find("title").string or "").lower()) else 0.9
                 # Add as a candidate, not an early return — let it compete
-                candidates.append(("inline-svg", website_url, 0.9))
+                candidates.append(("inline-svg", website_url, conf))
                 # Stash the SVG data for later retrieval (no rasterization)
                 _inline_svg_bytes = svg_bytes
 
@@ -558,15 +569,31 @@ def tier2_website_scrape(website_url: str) -> dict | None:
 
 
 def _is_spa_html(html: str) -> bool:
-    """Detect if HTML looks like a client-side SPA (Next.js, Nuxt, React, etc.)."""
+    """Detect if HTML looks like a client-side SPA (Next.js, Nuxt, React, Remix, Gatsby, etc.)."""
     soup = BeautifulSoup(html, "html.parser")
     # SPA indicators: framework root divs with very few <img> tags
-    spa_ids = {"__next", "__nuxt", "app", "root", "__app"}
+    spa_ids = {"__next", "__nuxt", "app", "root", "__app", "__remix", "__gatsby"}
     has_spa_root = any(soup.find(id=sid) for sid in spa_ids)
+
+    # Remix/React Router detection: data-discover attribute or __remixContext
+    if not has_spa_root:
+        has_spa_root = bool(soup.find(attrs={"data-discover": True}))
+    if not has_spa_root:
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            if any(sig in text for sig in ["__remixContext", "__NEXT_DATA__", "__NUXT__",
+                                            "window.__INITIAL_STATE__", "self.__next_f"]):
+                has_spa_root = True
+                break
+
     img_count = len(soup.find_all("img"))
-    # SPA pages often have <script> tags but few rendered images
     script_count = len(soup.find_all("script"))
-    return has_spa_root and img_count <= 2 and script_count > 3
+    # SPA: framework root + few images + many scripts
+    # Also catch pages with no body content but lots of scripts (pure CSR)
+    body = soup.find("body")
+    body_text_len = len(body.get_text(strip=True)) if body else 0
+    return (has_spa_root and img_count <= 2 and script_count > 3) or \
+           (script_count > 5 and body_text_len < 200 and img_count <= 1)
 
 
 def tier2b_playwright_scrape(website_url: str) -> dict | None:
@@ -609,9 +636,23 @@ def tier2b_playwright_scrape(website_url: str) -> dict | None:
         _logo_containers = soup.find_all(
             lambda tag: tag.name in ("header", "nav", "a", "div", "span")
             and any("logo" in (v if isinstance(v, str) else " ".join(v)).lower()
-                    for attr in ["class", "id", "aria-label"]
+                    for attr in ["class", "id", "aria-label", "alt", "title"]
                     for v in [tag.get(attr, "")] if v)
         )
+        # Also check <a> tags with homepage hrefs
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "")
+            aria = (a_tag.get("aria-label") or "").lower()
+            if href in ("/", website_url) or "home" in href.lower() or "home" in aria:
+                if a_tag not in _logo_containers:
+                    _logo_containers.append(a_tag)
+        # Check SVGs with <title> containing "logo"
+        for svg_el in soup.find_all("svg"):
+            title_el = svg_el.find("title")
+            if title_el and title_el.string and "logo" in title_el.string.lower():
+                parent = svg_el.parent
+                if parent and parent not in _logo_containers:
+                    _logo_containers.append(parent)
         for container in _logo_containers:
             svg_el = container.find("svg")
             if svg_el and len(str(svg_el)) > 100:
