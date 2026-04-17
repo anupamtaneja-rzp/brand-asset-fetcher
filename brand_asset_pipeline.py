@@ -2297,6 +2297,8 @@ async function exportZIP() {{
     const isSvg = cand ? cand.is_svg : b.is_svg;
     const ext = isSvg ? "svg" : "png";
 
+    let logoAdded = false;
+
     if (isSvg && cand && cand.svg_markup) {{
       // SVG with potential recolour baked in
       let svgMarkup = cand.svg_markup;
@@ -2305,29 +2307,39 @@ async function exportZIP() {{
         svgMarkup = _applyRecolour(svgMarkup, rcHex);
       }}
       zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, svgMarkup);
-      addedCount++;
-    }} else if (cand && cand.file) {{
-      // Raster — fetch full-quality file from candidates folder
+      logoAdded = true;
+    }}
+
+    if (!logoAdded && cand && cand.file) {{
+      // Raster — try to fetch full-quality file from candidates folder
       try {{
         const resp = await fetch(b.folder + "/" + cand.file);
-        const blob = await resp.blob();
-        zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, blob);
-        addedCount++;
+        if (resp.ok) {{
+          const blob = await resp.blob();
+          if (blob.size > 0) {{
+            zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, blob);
+            logoAdded = true;
+          }}
+        }}
       }} catch (e) {{
-        console.warn(`Failed to fetch ${{cand.file}} for ${{b.name}}:`, e);
+        console.warn(`Fetch failed for ${{b.name}}, falling back to thumbnail:`, e);
       }}
-    }} else if (cand && cand.thumb_b64) {{
-      // Last resort: use embedded thumbnail
+    }}
+
+    if (!logoAdded && cand && cand.thumb_b64) {{
+      // Fallback: use embedded thumbnail (base64)
       try {{
         const binary = atob(cand.thumb_b64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
         zip.file(`${{flagFolder}}/${{safeName}}.png`, bytes);
-        addedCount++;
+        logoAdded = true;
       }} catch (e) {{
         console.warn(`Failed to decode thumb for ${{b.name}}:`, e);
       }}
     }}
+
+    if (logoAdded) addedCount++;
   }}
 
   const content = await zip.generateAsync({{type:"blob"}});
