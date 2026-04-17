@@ -2008,14 +2008,19 @@ async function exportZIP() {{
   zip.file("brand_data.csv", csvStr);
   zip.file("brand_data.json", JSON.stringify(data, null, 2));
 
-  // Add logo PNGs (from base64 data already in page)
+  // Add logos — SVG when available, always include PNG as fallback
   for (const b of BRANDS) {{
     if (!finalized.has(b.folder)) continue;
+    const safeName = b.name.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\\s+/g, "_");
+    // Always include the PNG raster
     const logoSrc = getActiveLogo(b);
     if (logoSrc) {{
-      // Clean brand name for folder
-      const safeName = b.name.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\\s+/g, "_");
       zip.file(`logos/${{safeName}}.png`, logoSrc, {{base64: true}});
+    }}
+    // Include SVG if available (the actual vector file, not rasterized)
+    const svgMarkup = _getActiveSvgMarkup(b);
+    if (svgMarkup) {{
+      zip.file(`logos/${{safeName}}.svg`, svgMarkup);
     }}
   }}
 
