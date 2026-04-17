@@ -1467,11 +1467,14 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
 
         # Find the selected/primary logo and use its thumb_b64 as logo_b64
         logo_b64 = ""
+        primary_svg_markup = ""
         candidates = r.get("logo_candidates", [])
         if candidates:
             # Find the selected candidate, or use the first one
             sel_cand = next((c for c in candidates if c.get("is_selected")), candidates[0])
             logo_b64 = sel_cand.get("thumb_b64", "")
+            # Grab SVG markup from the primary candidate for JS fallback
+            primary_svg_markup = sel_cand.get("svg_markup", "")
 
         # Legacy fallback: read from disk if no candidates
         if not logo_b64:
@@ -1499,11 +1502,12 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
             "logo_quality_score": r.get("logo_quality_score", 1.0),
             "logo_issues": r.get("logo_issues", []),
             "logo_b64": logo_b64,
+            "svg_markup": primary_svg_markup,  # Top-level SVG markup from primary candidate (JS fallback)
             "logo_candidates": candidates,  # Full candidate list with thumb_b64, is_svg, file, tier, tier_name, source, confidence, size, svg_markup
         })
 
     brands_json = json.dumps(brands_js, cls=SafeEncoder)
-    failed_json = json.dumps([{"name": r["brand_name"], "errors": r.get("errors", [])} for r in failed])
+    failed_json = json.dumps([{"name": r["brand_name"], "website": r.get("website", ""), "errors": r.get("errors", [])} for r in failed])
     categories_json = json.dumps(all_categories)
 
     html = f"""<!DOCTYPE html>
@@ -1668,6 +1672,10 @@ def generate_review_html(results: list, out_dir: Path) -> Path | None:
 <div class="failed-section" id="failedSection"></div>
 
 <div class="export-bar">
+  <button class="btn-export" style="background:#0277bd;" onclick="saveSession()">Save Session</button>
+  <button class="btn-export" style="background:#0277bd;" onclick="document.getElementById('loadSessionInput').click()">Load Session</button>
+  <input type="file" id="loadSessionInput" accept=".json" style="display:none" onchange="loadSession(event)">
+  <span style="color:#555;font-size:18px;">|</span>
   <button class="btn-export" onclick="exportJSON()">Export JSON</button>
   <button class="btn-export" style="background:#555;" onclick="exportCSV()">Export CSV</button>
   <button class="btn-export" style="background:#2e7d32;" onclick="exportZIP()">Export ZIP (assets + data)</button>
@@ -1723,20 +1731,8 @@ function customColour(folder, inputEl, evt) {{
 
 function selectLogo(folder, candIdx) {{
   selectedLogos[folder] = candIdx;
-  const b = BRANDS.find(x => x.folder === folder);
-  if (!b) return;
-  // Update detail panel preview
-  const cand = b.logo_candidates[candIdx];
-  const preview = document.querySelector("#detailPanel .detail-preview");
-  if (preview) {{
-    const img = preview.querySelector("img");
-    if (img && cand.thumb_b64) img.src = "data:image/png;base64," + cand.thumb_b64;
-  }}
-  // Mark selected in picker
-  document.querySelectorAll("#detailPanel .logo-option").forEach((el, i) => {{
-    el.classList.toggle("selected", i === candIdx);
-  }});
-  // Update grid card too
+  // Re-render detail panel fully so recolour controls appear/disappear based on SVG
+  openDetail(folder);
   renderGrid();
 }}
 
@@ -1767,10 +1763,17 @@ function resetLogoColour(folder) {{
 }}
 
 function _getActiveSvgMarkup(b) {{
+  // Check explicitly selected candidate first
   const idx = selectedLogos[b.folder];
   if (idx !== undefined && b.logo_candidates[idx] && b.logo_candidates[idx].svg_markup) {{
     return b.logo_candidates[idx].svg_markup;
   }}
+  // Fallback: check the is_selected (primary) candidate
+  if (b.logo_candidates) {{
+    const sel = b.logo_candidates.find(c => c.is_selected);
+    if (sel && sel.svg_markup) return sel.svg_markup;
+  }}
+  // Final fallback: top-level svg_markup from primary
   return b.svg_markup || "";
 }}
 
@@ -2048,41 +2051,160 @@ function renderGrid() {{
   document.getElementById("progressFill").style.width = `${{Math.round(finalCount/BRANDS.length*100)}}%`;
 }}
 
+// ─── SAVE / LOAD SESSION ───
+function saveSession() {{
+  const session = {{
+    version: 1,
+    saved_at: new Date().toISOString(),
+    finalized: Array.from(finalized),
+    flagged: {{ ...flagged }},
+    selectedLogos: {{ ...selectedLogos }},
+    logoRecolours: {{ ...logoRecolours }},
+    selectedColours: {{ ...selectedColours }},
+  }};
+  const blob = new Blob([JSON.stringify(session, null, 2)], {{type: "application/json"}});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "review_session.json";
+  a.click();
+  document.getElementById("exportStatus").textContent = `Session saved (${{finalized.size}} finalized, ${{Object.keys(flagged).length}} flagged)`;
+}}
+
+function loadSession(event) {{
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {{
+    try {{
+      const session = JSON.parse(e.target.result);
+      // Restore state
+      finalized = new Set(session.finalized || []);
+      flagged = session.flagged || {{}};
+      selectedLogos = session.selectedLogos || {{}};
+      logoRecolours = session.logoRecolours || {{}};
+      selectedColours = session.selectedColours || {{}};
+      // Re-render
+      renderGrid();
+      document.getElementById("exportStatus").textContent = `Session loaded (${{finalized.size}} finalized, ${{Object.keys(flagged).length}} flagged)`;
+    }} catch (err) {{
+      document.getElementById("exportStatus").textContent = "Error loading session: " + err.message;
+    }}
+  }};
+  reader.readAsText(file);
+  event.target.value = "";  // reset so same file can be reloaded
+}}
+
 // ─── EXPORTS ───
+
+// Get the effective candidate for a brand (explicit selection > is_selected primary > first)
+function _getEffectiveCandidate(b) {{
+  const selIdx = selectedLogos[b.folder];
+  if (selIdx !== undefined && b.logo_candidates && b.logo_candidates[selIdx]) {{
+    return b.logo_candidates[selIdx];
+  }}
+  if (b.logo_candidates && b.logo_candidates.length) {{
+    const primary = b.logo_candidates.find(c => c.is_selected);
+    return primary || b.logo_candidates[0];
+  }}
+  return null;
+}}
+
 function _buildExportData() {{
   return BRANDS.filter(b => finalized.has(b.folder)).map(b => {{
-    const selIdx = selectedLogos[b.folder];
-    const selCand = selIdx !== undefined && b.logo_candidates ? b.logo_candidates[selIdx] : null;
-    const selFile = selCand ? selCand.file : (b.is_svg ? b.folder + "/logo.svg" : b.folder + "/logo.png");
-    const fmt = selCand ? (selCand.is_svg ? "svg" : "png") : (b.is_svg ? "svg" : "png");
+    const cand = _getEffectiveCandidate(b);
+    const fmt = cand ? (cand.is_svg ? "svg" : "png") : (b.is_svg ? "svg" : "png");
+    const bgColour = selectedColours[b.folder] || b.colour;
+    const safeName = b.name.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\\s+/g, "_");
+    const logoFilename = `${{safeName}}.${{fmt}}`;
+
     return {{
+      // ── Reward Catalogue standard columns ──
+      category_display_name: b.category || "",
       brand_name: b.name,
-      folder: b.folder,
-      category: b.category,
-      website: b.website || "",
-      bg_colour: selectedColours[b.folder] || b.colour,
-      logo_recolour: logoRecolours[b.folder] || null,
-      meta_description: b.meta_description || "",
-      selected_file: selFile,
-      format: fmt,
-      logo_source: b.source,
+      brand_description: b.meta_description || "",
+      brand_url: b.website || "",
+      brand_logo_url: logoFilename,
+      brand_background_colour: bgColour,
+      reward_display_name: b.name,
+      offer_redemption_channel: "",
+      offer_redemption_url: b.website || "",
+      reward_image_url: "",
+      reward_bgcolor_code: bgColour,
+      translation_short_description: b.meta_description || "",
+      translation_description: "",
+      translation_how_to_redeem: "",
+      translation_terms_and_conditions: "",
+      // ── Pipeline internal columns ──
+      flag_reason: flagged[b.folder] || "",
+      logo_format: fmt,
+      logo_recolour: logoRecolours[b.folder] || "",
       source_tier: b.tier,
       confidence: b.confidence,
       blending_risk: b.blending_risk,
       logo_quality_score: b.logo_quality_score,
-      logo_issues: b.logo_issues || [],
-      original_size: b.original_size,
-      undersize: b.undersize,
-      bg_removed: b.bg_removed,
-      flag_reason: flagged[b.folder] || null,
+      logo_issues: (b.logo_issues || []).join("; "),
+      original_size: b.original_size || "",
+      undersize: b.undersize || false,
+      bg_removed: b.bg_removed || false,
+      // internal ref
+      _folder: b.folder,
+      _cand: cand,
     }};
   }});
+}}
+
+function _buildRemainingData() {{
+  const rows = [];
+  // Sourced but not finalized
+  BRANDS.filter(b => !finalized.has(b.folder)).forEach(b => {{
+    const numCands = (b.logo_candidates && b.logo_candidates.length) || 0;
+    rows.push({{
+      brand_name: b.name,
+      brand_url: b.website || "",
+      category: b.category || "",
+      meta_description: b.meta_description || "",
+      status: numCands > 0 ? "sourced_not_finalized" : "no_candidates",
+      num_candidates: numCands,
+      best_source_tier: b.tier || "",
+      logo_source: b.source || "",
+      confidence: b.confidence || 0,
+      blending_risk: b.blending_risk || "",
+      flag_reason: flagged[b.folder] || "",
+      errors: "",
+    }});
+  }});
+  // Failed brands (pipeline couldn't source at all)
+  FAILED.forEach(f => {{
+    rows.push({{
+      brand_name: f.name,
+      brand_url: f.website || "",
+      category: "",
+      meta_description: "",
+      status: "failed",
+      num_candidates: 0,
+      best_source_tier: "",
+      logo_source: "",
+      confidence: 0,
+      blending_risk: "",
+      flag_reason: "",
+      errors: (f.errors || []).join("; "),
+    }});
+  }});
+  return rows;
+}}
+
+function _csvFromRows(rows) {{
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  return [headers.join(","), ...rows.map(r => headers.map(h => `"${{String(r[h] != null ? r[h] : "").replace(/"/g,'""')}}"`).join(","))].join("\\n");
 }}
 
 function exportJSON() {{
   const data = _buildExportData();
   if (!data.length) {{ document.getElementById("exportStatus").textContent = "No finalized brands"; return; }}
-  const blob = new Blob([JSON.stringify(data, null, 2)], {{type: "application/json"}});
+  // Strip internal fields
+  const clean = data.map(({{ _folder, _cand, ...rest }}) => rest);
+  const blob = new Blob([JSON.stringify(clean, null, 2)], {{type: "application/json"}});
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "approved_brands.json"; a.click();
   document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (JSON)`;
 }}
@@ -2090,9 +2212,8 @@ function exportJSON() {{
 function exportCSV() {{
   const data = _buildExportData();
   if (!data.length) {{ document.getElementById("exportStatus").textContent = "No finalized brands"; return; }}
-  const flat = data.map(d => ({{ ...d, logo_issues: (d.logo_issues||[]).join("; "), logo_recolour: d.logo_recolour||"" }}));
-  const headers = Object.keys(flat[0]);
-  const csv = [headers.join(","), ...flat.map(r => headers.map(h => `"${{String(r[h]||"").replace(/"/g,'""')}}"`).join(","))].join("\\n");
+  const clean = data.map(({{ _folder, _cand, ...rest }}) => rest);
+  const csv = _csvFromRows(clean);
   const blob = new Blob([csv], {{type:"text/csv"}});
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "approved_brands.csv"; a.click();
   document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (CSV)`;
@@ -2104,55 +2225,74 @@ async function exportZIP() {{
   document.getElementById("exportStatus").textContent = "Building ZIP...";
   const zip = new JSZip();
 
-  // Add data CSV and JSON
-  const flat = data.map(d => ({{ ...d, logo_issues: (d.logo_issues||[]).join("; "), logo_recolour: d.logo_recolour||"" }}));
-  const headers = Object.keys(flat[0]);
-  const csvStr = [headers.join(","), ...flat.map(r => headers.map(h => `"${{String(r[h]||"").replace(/"/g,'""')}}"`).join(","))].join("\\n");
-  zip.file("brand_data.csv", csvStr);
-  zip.file("brand_data.json", JSON.stringify(data, null, 2));
+  // Add Reward Catalogue CSV (brand_data.csv) — clean, no internal fields
+  const cleanData = data.map(({{ _folder, _cand, ...rest }}) => rest);
+  zip.file("brand_data.csv", _csvFromRows(cleanData));
+  zip.file("brand_data.json", JSON.stringify(cleanData, null, 2));
+
+  // Add remaining brands CSV
+  const remaining = _buildRemainingData();
+  if (remaining.length) {{
+    zip.file("remaining_brands.csv", _csvFromRows(remaining));
+  }}
 
   // Add logos sorted by flag status
+  let addedCount = 0;
   for (const d of data) {{
-    const b = BRANDS.find(x => x.folder === d.folder);
+    const folder = d._folder;
+    const cand = d._cand;
+    const b = BRANDS.find(x => x.folder === folder);
     if (!b) continue;
-    const selIdx = selectedLogos[b.folder];
-    const selCand = selIdx !== undefined && b.logo_candidates ? b.logo_candidates[selIdx] : null;
 
     // Determine flag folder
     let flagFolder = "final";
-    const reason = flagged[b.folder];
+    const reason = flagged[folder];
     if (reason === "wrong-logo") flagFolder = "flagged_wrong_logo";
     else if (reason === "needs-upscaling") flagFolder = "flagged_needs_upscaling";
     else if (reason === "wrong-colour") flagFolder = "flagged_wrong_colour";
     else if (reason === "other") flagFolder = "flagged_other";
 
     const safeName = b.name.replace(/[^a-zA-Z0-9 _-]/g, "").replace(/\\s+/g, "_");
-    const isSelSvg = selCand ? selCand.is_svg : b.is_svg;
-    const ext = isSelSvg ? "svg" : "png";
+    const isSvg = cand ? cand.is_svg : b.is_svg;
+    const ext = isSvg ? "svg" : "png";
 
-    if (isSelSvg && selCand && selCand.svg_markup) {{
-      // SVG with potential recolour
-      let svgMarkup = selCand.svg_markup;
-      const rcHex = logoRecolours[b.folder];
+    if (isSvg && cand && cand.svg_markup) {{
+      // SVG with potential recolour baked in
+      let svgMarkup = cand.svg_markup;
+      const rcHex = logoRecolours[folder];
       if (rcHex) {{
         svgMarkup = _applyRecolour(svgMarkup, rcHex);
       }}
       zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, svgMarkup);
-    }} else if (selCand && selCand.file) {{
-      // PNG - fetch from candidates folder
+      addedCount++;
+    }} else if (cand && cand.file) {{
+      // Raster — fetch full-quality file from candidates folder
       try {{
-        const resp = await fetch(b.folder + "/" + selCand.file);
+        const resp = await fetch(b.folder + "/" + cand.file);
         const blob = await resp.blob();
         zip.file(`${{flagFolder}}/${{safeName}}.${{ext}}`, blob);
+        addedCount++;
       }} catch (e) {{
-        console.warn(`Failed to fetch ${{selCand.file}}:`, e);
+        console.warn(`Failed to fetch ${{cand.file}} for ${{b.name}}:`, e);
+      }}
+    }} else if (cand && cand.thumb_b64) {{
+      // Last resort: use embedded thumbnail
+      try {{
+        const binary = atob(cand.thumb_b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        zip.file(`${{flagFolder}}/${{safeName}}.png`, bytes);
+        addedCount++;
+      }} catch (e) {{
+        console.warn(`Failed to decode thumb for ${{b.name}}:`, e);
       }}
     }}
   }}
 
   const content = await zip.generateAsync({{type:"blob"}});
   const a = document.createElement("a"); a.href = URL.createObjectURL(content); a.download = "approved_brand_assets.zip"; a.click();
-  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (ZIP with logos + data)`;
+  const remMsg = remaining.length ? ` | ${{remaining.length}} remaining brands listed` : "";
+  document.getElementById("exportStatus").textContent = `Exported ${{data.length}} brands (${{addedCount}} logos)${{remMsg}}`;
 }}
 
 // ─── EVENT LISTENERS ───
@@ -2439,6 +2579,14 @@ def process_brand(brand_name: str, website: str,
             filepath.write_bytes(squared_svg)
             cand_info["file"] = f"candidates/{filename}"
             cand_info["size"] = "vector"
+
+            # Embed SVG markup for inline rendering + recolouring in HTML
+            try:
+                svg_text = squared_svg.decode("utf-8", errors="replace") if isinstance(squared_svg, bytes) else squared_svg
+                if "<svg" in svg_text.lower() and len(svg_text) < 200_000:
+                    cand_info["svg_markup"] = svg_text
+            except Exception:
+                pass
 
             # Create thumbnail by rasterizing the SVG
             thumb_img = _svg_to_pil(squared_svg, 400)
