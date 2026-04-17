@@ -349,6 +349,7 @@ def tier2_website_scrape(website_url: str) -> dict | None:
                 candidates.append(("svg-img", urljoin(base, src), 0.93))
 
     # Priority 0.5: Inline <svg> elements in header/nav/logo containers
+    _inline_svg_found = False
     _logo_containers = soup.find_all(
         lambda tag: tag.name in ("header", "nav", "a", "div", "span")
         and any("logo" in (v if isinstance(v, str) else " ".join(v)).lower()
@@ -362,7 +363,7 @@ def tier2_website_scrape(website_url: str) -> dict | None:
             _logo_containers.append(a_tag)
     for container in _logo_containers:
         svg_el = container.find("svg")
-        if svg_el:
+        if svg_el and not _inline_svg_found:
             svg_str = str(svg_el)
             if len(svg_str) > 100:  # skip trivial/icon SVGs
                 # Ensure the SVG has xmlns for standalone rendering
@@ -371,19 +372,12 @@ def tier2_website_scrape(website_url: str) -> dict | None:
                 svg_bytes = svg_str.encode("utf-8")
                 img = _svg_to_pil(svg_bytes, TARGET_SIZE)
                 if img:
-                    result = {
-                        "source": "website:inline-svg",
-                        "image": img, "is_svg": True,
-                        "svg_data": svg_bytes,
-                        "url": website_url,
-                        "confidence": 0.9,
-                        "theme_color": None,
-                    }
-                    # Grab theme-color while we're here
-                    tc = soup.find("meta", attrs={"name": "theme-color"})
-                    if tc and tc.get("content"):
-                        result["theme_color"] = tc["content"].strip()
-                    return result
+                    # Add as a candidate, not an early return — let it compete
+                    candidates.append(("inline-svg", website_url, 0.9))
+                    # Stash the pre-rasterized image + SVG data for later retrieval
+                    _inline_svg_found = True
+                    _inline_svg_img = img
+                    _inline_svg_bytes = svg_bytes
 
     # Priority 1: apple-touch-icon
     for link in soup.find_all("link", rel=lambda r: r and "apple-touch-icon" in " ".join(r).lower()):
@@ -429,10 +423,23 @@ def tier2_website_scrape(website_url: str) -> dict | None:
 
     # Try candidates in priority order
     candidates.sort(key=lambda x: -x[2])
+    fetched = []
     for source_type, url, confidence in candidates:
+        # Inline SVGs are already rasterized — no fetch needed
+        if source_type == "inline-svg" and _inline_svg_found:
+            fetched.append({
+                "source": "website:inline-svg",
+                "image": _inline_svg_img,
+                "is_svg": True,
+                "svg_data": _inline_svg_bytes,
+                "url": url,
+                "confidence": confidence,
+                "theme_color": theme_color,
+            })
+            continue
         img, is_svg, svg_raw = _fetch_image(url, referer=website_url)
         if img:
-            result = {
+            r = {
                 "source": f"website:{source_type}",
                 "image": img,
                 "is_svg": is_svg,
@@ -441,10 +448,15 @@ def tier2_website_scrape(website_url: str) -> dict | None:
                 "theme_color": theme_color,
             }
             if svg_raw:
-                result["svg_data"] = svg_raw
-            return result
+                r["svg_data"] = svg_raw
+            fetched.append(r)
 
-    return None
+    if not fetched:
+        return None
+    # In multi mode, return all fetched candidates; otherwise just the best
+    if MULTI_CANDIDATES and len(fetched) > 1:
+        return fetched  # list of dicts
+    return fetched[0]   # single dict (classic behaviour)
 
 
 def _is_spa_html(html: str) -> bool:
@@ -2122,21 +2134,27 @@ def process_brand(brand_name: str, website: str,
             # Debug: tier returned nothing
             pass  # individual tier functions already print warnings
         if td:
-            cand = {
-                "tier": tier_num, "tier_name": tier_name,
-                "source": td.get("source", tier_name),
-                "image": td["image"], "is_svg": td.get("is_svg", False),
-                "url": td.get("url"), "confidence": td.get("confidence", 0.5),
-            }
-            if td.get("svg_data"):
-                cand["svg_data"] = td["svg_data"]
-            if td.get("theme_color"):
-                theme_color = td["theme_color"]
-            if td.get("si_colour"):
-                cand["si_colour"] = td["si_colour"]
-            logo_candidates.append(cand)
+            # A tier can return a single dict or a list of dicts (multi mode)
+            td_list = td if isinstance(td, list) else [td]
+            first_cand = None
+            for td_item in td_list:
+                cand = {
+                    "tier": tier_num, "tier_name": tier_name,
+                    "source": td_item.get("source", tier_name),
+                    "image": td_item["image"], "is_svg": td_item.get("is_svg", False),
+                    "url": td_item.get("url"), "confidence": td_item.get("confidence", 0.5),
+                }
+                if td_item.get("svg_data"):
+                    cand["svg_data"] = td_item["svg_data"]
+                if td_item.get("theme_color"):
+                    theme_color = td_item["theme_color"]
+                if td_item.get("si_colour"):
+                    cand["si_colour"] = td_item["si_colour"]
+                logo_candidates.append(cand)
+                if first_cand is None:
+                    first_cand = cand
             if not logo_data:
-                logo_data = cand
+                logo_data = first_cand
                 result["source_tier"] = tier_num
 
     if not logo_data:
