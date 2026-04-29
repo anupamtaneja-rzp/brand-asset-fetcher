@@ -1,23 +1,31 @@
-# How to Run the Brand Asset Pipeline v7
+# How to Run the Brand Asset Pipeline v7.2
 
 ## What you'll get
 A folder (e.g. `batch_1_assets/`) with:
-- **Each brand's folder** containing a `candidates/` subfolder with ALL sourced logos (PNG and SVG, full quality, **pre-padded square canvas with 12px padding**)
-- **review.html** — interactive review page served at `localhost:4200`: pick the best logo per brand, recolour SVGs, flag issues, save/load sessions, export
+- **Each brand's folder** containing a `candidates/` subfolder with ALL sourced logos. The padded preview is a `.png`; the **raw original** is preserved in its native format (`.webp`, `.jpg`, `.png`, `.svg`, etc.) inside `candidates/raw/`.
+- **review.html** — interactive review page served at `localhost:4200`: pick the best logo per brand, recolour SVGs, monochromize rasters, mark which ones to upscale, flag issues, save/load sessions, export
 - **review.csv** — spreadsheet with colours, confidence scores, blending risks
 - **pipeline_summary.json** — full processing results
+- **input_rows.json** — original CSV rows indexed by brand name (for `merchant_id` / `merchant_email` passthrough at finalize)
 - **pipeline.log** — detailed debug log (fetch errors, HTTP statuses, tier diagnostics)
 
 After finalizing (separate step):
-- **`<output>_final.zip`** — production-quality assets with upscaled rasters and proper SVG recolouring
+- **`<output>_final.zip`** — production-quality assets. Logos are passed through in their original format when no manipulation is needed (WebP stays WebP, JPEG stays JPEG, etc.) — and converted to PNG only when you've requested recolour, monochromize, or upscale.
 
-### What changed in v7
+### What changed in v7.2
+- **Original raster format preserved end-to-end** — WebP/JPEG/AVIF logos stay as `.webp`/`.jpg`/`.avif` in raw/ AND in the final ZIP (when no manipulation is requested). Zero re-encoding loss. Pass-through copy at finalize when reviewer didn't recolour/monochromize/upscale.
+- **Upscaling is now opt-in per brand** — pipeline never auto-flags. Default: nothing upscales. Reviewer ticks "Upscale this logo 4x at finalize" in the detail panel for any brand they want upscaled. Resolution badge in the grid shows `↑4x` only on opted-in logos.
+- **`merchant_id` and `merchant_email` passthrough** — extra columns from your input CSV (e.g. `merchant_id`, `merchant_email`) are carried through to the final `brand_data.csv`, so you can map back to your CRM.
+- **WebP/JPEG/AVIF accepted from Wikimedia** — tier 3 search no longer hard-filters to SVG+PNG.
+- **SVG bbox letterbox fix** — non-square SVGs (wordmarks like Vodafone/IndiGo) no longer render off-centre or cropped after viewBox normalization.
+
+### What changed in v7 (carried forward)
 - **Two-stage processing**: light pass during sourcing (padding/squaring), heavy pass on shortlisted finalists only (upscaling + DOM-based SVG recolour). Saves time — you don't upscale candidates you'll reject.
 - **Server-side SVG processing** — proper XML parsing replaces the old regex approach. Recolouring now handles inline `style=""`, `<style>` blocks, gradient stops, and CSS classes correctly.
-- **Auto padding & square canvas** — every candidate (PNG and SVG) gets 12px padding on a square canvas during sourcing. What you see in review is what you'll ship.
-- **Upscayl integration** — rasters under 500px get 4x upscaled via `realesrgan-ncnn-vulkan` during finalize. Edge-preserving model tuned for logos.
-- **`--finalize` command** — new mode that reads your saved review session and produces the production-quality ZIP for engineering handoff.
-- **Skip-upscale toggle** — per-brand opt-out in review UI for intentionally low-res sources (pixel art, etc.)
+- **Auto padding & square canvas** — every candidate gets 12px padding on a square canvas during sourcing. What you see in review is what you'll ship.
+- **Upscayl integration** — `realesrgan-ncnn-vulkan` via the bundled Upscayl app binary. Edge-preserving model tuned for logos.
+- **`--finalize` command** — separate mode that reads your saved review session and produces the production-quality ZIP for engineering handoff.
+- **Raster monochromize** — alpha-preserving lossless silhouette conversion to black or white via in-browser preview, baked at finalize.
 
 ### Carried over from v6
 - All candidates saved at full quality in `candidates/` subfolder; sources from all 9 tiers automatically
@@ -41,18 +49,28 @@ python brand_asset_pipeline.py --input batch_1_brands.csv --output batch_1_asset
 Pipeline sources logos from all 9 tiers, pads each candidate with 12px on a square canvas, and auto-opens the review page at `http://localhost:4200/review.html`.
 
 ### Phase 2 — Review in browser (~30 min for 80 brands)
-- Pick the best candidate per brand (or flag with reason)
-- Optionally pick a recolour for SVGs (live preview)
-- Optionally toggle **Skip upscale** for any brand whose raster you want to keep low-res
-- Click **Save Session** every 10–15 min — downloads `review_session.json` to your Downloads folder
-- When done, **move `review_session.json` into the `batch_1_assets/` folder**
-- Press `Ctrl+C` in the terminal to stop the server
+For each brand in the grid:
+- Pick the best candidate (or flag it with a reason)
+- (SVG only) Pick a **recolour** — live preview shows the new colour
+- (Raster only) Pick a **logo colour** — `Original` / `Black silhouette` / `White silhouette`. Lossless, alpha-preserving.
+- (Raster only) Tick **"Upscale this logo 4x at finalize"** for any logo whose source resolution is too low. Default is OFF — only the ones you tick get upscaled.
+- (Optional) Set a **background colour** for the catalogue card
+
+Periodically click **Save Session** — downloads `review_session.json` to your Downloads folder. When fully done, **move `review_session.json` into the `batch_1_assets/` folder**, then press `Ctrl+C` in the terminal to stop the server.
 
 ### Phase 3 — Finalize for engineering handoff (5–10 min)
 ```bash
 python brand_asset_pipeline.py --finalize batch_1_assets --upscale --threads 4
 ```
-Reads your session, runs Upscayl on rasters under 500px, applies SVG recolouring properly via DOM parsing, re-pads everything, and outputs `batch_1_assets_final.zip`. Send that ZIP to engineering.
+Reads your session and:
+- For SVGs: applies DOM-based recolour (handles inline styles, gradient stops, etc.) and writes `.svg`
+- For rasters you opted into upscaling: runs Upscayl 4x, then applies monochromize/pad as requested, writes `.png`
+- For rasters with no manipulation requested: **pass-through copy** of the original file in its native format (`.webp` stays `.webp`, etc.)
+- Builds `batch_1_assets_final.zip` with the Reward Catalogue CSV (including `merchant_id` and `merchant_email` passthrough)
+
+Send that ZIP to engineering.
+
+> **Tip:** if you don't pass `--upscale`, the pipeline still runs and just warns about any brands you opted in. Use that for a "no upscale" preview run, then re-finalize with `--upscale` once Upscayl is installed.
 
 ---
 
@@ -69,12 +87,13 @@ pip install requests beautifulsoup4 Pillow scikit-learn numpy rembg onnxruntime 
 pip install playwright
 python -m playwright install chromium
 
-# Required for upscaling — choose one:
-# Option A: brew install realesrgan-ncnn-vulkan
-# Option B: download Upscayl from https://upscayl.org/ — pipeline auto-detects the bundled binary
+# Optional — for upscaling rasters at finalize time:
+#  Option A (recommended): download Upscayl from https://upscayl.org/ → drag to Applications.
+#                          Pipeline auto-detects /Applications/Upscayl.app/Contents/Resources/bin/upscayl-bin
+#  Option B: brew install --cask upscayl  (uses the official cask; same auto-detection as Option A)
 ```
 
-If neither Upscayl install path works, you can still run the pipeline with `--no-upscale` and finalize will skip upscaling (rasters keep their original size).
+If Upscayl isn't installed, `--finalize` runs fine without `--upscale`. Any logos you opted into upscaling get a warning in the report and pass through at original resolution.
 
 ### Resume a previous review session
 ```bash
@@ -200,7 +219,9 @@ The output `batch_1_assets_final.zip` contains:
 | `translation_how_to_redeem` | Empty (ops writes) |
 | `translation_terms_and_conditions` | Empty (ops writes) |
 
-Pipeline internal columns appended after: `flag_reason`, `logo_format`, `logo_recolour`, `source_tier`, `confidence`, `blending_risk`, `logo_quality_score`, `logo_issues`, `original_size`, `undersize`, `bg_removed`.
+Pipeline internal columns appended after the standard 15: `flag_reason`, `logo_format` (actual file extension — `svg` / `webp` / `jpg` / `png`), `logo_recolour`, `logo_monochrome`, `upscaled` (yes/no), `passthrough` (yes/no — true when the original file was copied verbatim), `source_tier`, `source_name`, `original_size`.
+
+**Input CSV passthrough columns:** `merchant_id` and `merchant_email` from your input CSV are carried through to `brand_data.csv` automatically — no extra config. Any other extra columns in your input are ignored by the pipeline but available in `input_rows.json` if you want to add them to the final CSV later.
 
 ---
 
@@ -210,8 +231,13 @@ Pipeline internal columns appended after: `flag_reason`, `logo_format`, `logo_re
 batch_1_assets/
   saregama/
     candidates/
-      00_brandfetch_logodev.png
-      01_website_svg-link.svg
+      raw/                              ← original files, untouched
+        00_brandfetch_logodev.webp      ← format preserved (was WebP at source)
+        01_website_svg-link.svg
+        02_website_apple-touch-icon.png
+        03_simpleicons_svg.svg
+      00_brandfetch_logodev.png         ← padded preview (always PNG)
+      01_website_svg-link.svg           ← normalized SVG (viewBox padded)
       02_website_apple-touch-icon.png
       03_simpleicons_svg.svg
     logo.png
@@ -219,11 +245,13 @@ batch_1_assets/
     meta.json
   another_brand/
     candidates/
+      raw/...
       ...
     meta.json
   review.html
   review.csv
   pipeline_summary.json
+  input_rows.json                       ← original CSV rows (for passthrough)
   pipeline.log
 ```
 
@@ -295,7 +323,10 @@ Try: `brew install cairo` first, then `pip install cairosvg`.
 Make sure the review page is served via `localhost` (not opened as a local file). The pipeline auto-starts the server, but if you opened `review.html` directly, re-open via `--serve`.
 
 **`--finalize` says "Upscayl not found"**
-Either install via `brew install realesrgan-ncnn-vulkan`, or download Upscayl from https://upscayl.org/ and the pipeline will auto-detect the bundled binary. Or just run `--finalize` without `--upscale` to skip upscaling — rasters will keep their original resolution.
+Easiest fix: download Upscayl from https://upscayl.org/ → drag to Applications. Pipeline auto-detects `/Applications/Upscayl.app/Contents/Resources/bin/upscayl-bin`. Alternatively `brew install --cask upscayl`. Or just run `--finalize` without `--upscale` to skip upscaling — rasters keep their original resolution and any opted-in brands get a warning in the report.
+
+**No logos got upscaled even though I expected them to**
+Two things must both be true: (1) you ticked "Upscale this logo 4x at finalize" in the review UI for those brands (defaults to OFF in v7.2), AND (2) you passed `--upscale` to the finalize command. Both are required. Check `finalize_report.txt` for per-brand status.
 
 **`--finalize` says "review_session.json not found"**
 After reviewing in the browser, click **Save Session** and move the downloaded JSON file into your output folder (e.g. `batch_1_assets/review_session.json`). Then re-run `--finalize`.
