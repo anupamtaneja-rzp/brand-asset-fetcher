@@ -2938,6 +2938,41 @@ def _safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-]", "_", s).strip("_") or "brand"
 
 
+# Output formats engineering accepts. Anything else (AVIF, GIF, BMP, TIFF, ICO)
+# is converted to PNG before being written to the final ZIP.
+ALLOWED_OUTPUT_EXTS = {"png", "jpg", "jpeg", "webp", "svg"}
+
+
+def _copy_or_convert(src_path: Path, dest_dir: Path, safe_name: str) -> tuple[Path, str]:
+    """
+    Copy `src_path` to `dest_dir/<safe_name>.<ext>`. If the source extension is
+    in ALLOWED_OUTPUT_EXTS, copy verbatim. Otherwise, open with PIL and save as PNG.
+
+    Returns (dest_path, ext_used).
+    """
+    src_ext = src_path.suffix.lstrip(".").lower()
+    if src_ext in ALLOWED_OUTPUT_EXTS:
+        dest = dest_dir / f"{safe_name}.{src_ext}"
+        import shutil as _sh
+        _sh.copyfile(src_path, dest)
+        return dest, src_ext
+
+    # Unsupported format — convert to PNG via PIL
+    from PIL import Image as _PILImage
+    dest = dest_dir / f"{safe_name}.png"
+    try:
+        img = _PILImage.open(src_path).convert("RGBA")
+        img.save(dest, format="PNG", optimize=True)
+        log.info(f"[finalize] Converted {src_ext.upper()} → PNG for output: {src_path.name}")
+    except Exception as e:
+        # Last-resort fallback: just copy the bytes (engineering will handle / flag)
+        log.warning(f"[finalize] Could not convert {src_path.name} to PNG ({e}); falling back to raw copy")
+        dest = dest_dir / f"{safe_name}.{src_ext or 'bin'}"
+        import shutil as _sh
+        _sh.copyfile(src_path, dest)
+    return dest, dest.suffix.lstrip(".").lower()
+
+
 def _flag_folder(reason: str | None) -> str:
     """Map a flag reason to its destination subfolder."""
     if not reason:
@@ -3151,14 +3186,16 @@ def _finalize(out_dir: Path, args) -> int:
                 will_upscale = outcome["upscaled"]
 
                 if not will_monochromize and not will_upscale:
-                    # No pixel manipulation required → preserve original format byte-for-byte
-                    raw_ext = (cand.get("raw_format") or source_path.suffix.lstrip(".") or "png").lower()
-                    dest = dest_subdir / f"{safe}.{raw_ext}"
-                    import shutil as _sh
-                    _sh.copyfile(source_path, dest)
+                    # No pixel manipulation required → preserve original format if it's
+                    # in the allowed set (PNG/JPG/JPEG/WEBP). Convert to PNG otherwise.
+                    dest, used_ext = _copy_or_convert(source_path, dest_subdir, safe)
                     outcome["output_file"] = str(dest.relative_to(final_root))
                     outcome["status"] = "ok"
                     outcome["passthrough"] = True
+                    # If we converted (raw was non-allowed), it's not strictly passthrough,
+                    # but we still skipped recolour/monochromize/upscale.
+                    if used_ext == "png" and (cand.get("raw_format") or "").lower() not in ALLOWED_OUTPUT_EXTS:
+                        outcome["converted_format"] = True
                 else:
                     # Pixel manipulation needed → convert to PNG (alpha-aware, lossless for our ops)
                     img = PILImage.open(source_path).convert("RGBA")
@@ -3183,11 +3220,8 @@ def _finalize(out_dir: Path, args) -> int:
                 # Use the actual raw_path (untouched original from candidates/raw/)
                 raw_to_copy = brand_dir / (cand.get("raw_file") or "")
                 if raw_to_copy.exists():
-                    orig_ext = raw_to_copy.suffix.lstrip(".").lower() or "bin"
-                    orig_dest = originals_dir / f"{safe}.{orig_ext}"
                     try:
-                        import shutil as _sh
-                        _sh.copyfile(raw_to_copy, orig_dest)
+                        orig_dest, _ = _copy_or_convert(raw_to_copy, originals_dir, safe)
                         outcome["original_file"] = str(orig_dest.relative_to(final_root))
                     except Exception as e:
                         outcome["warnings"].append(f"Could not copy original: {e}")
