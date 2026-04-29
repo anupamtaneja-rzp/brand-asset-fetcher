@@ -3438,10 +3438,13 @@ def _finalize(out_dir: Path, args) -> int:
             input_row = input_rows_by_brand.get(brand.get("brand_name", ""), {}) or {}
             merchant_id = input_row.get("merchant_id", "") or input_row.get("Merchant ID", "")
             merchant_email = input_row.get("merchant_email", "") or input_row.get("Merchant Email", "")
+            # Resolve the scraped meta description; fall back to scraped_text if needed
+            meta_desc = brand.get("meta_description") or brand.get("scraped_meta") or ""
+            scraped_text = brand.get("scraped_text") or ""
             csv_rows.append({
                 "category_display_name": brand.get("category", ""),
                 "brand_name": brand.get("brand_name", ""),
-                "brand_description": brand.get("scraped_meta", ""),
+                "brand_description": meta_desc,
                 "brand_url": brand.get("website", ""),
                 "brand_logo_url": output_filename,
                 "brand_background_colour": o.get("bg_colour", ""),
@@ -3450,8 +3453,8 @@ def _finalize(out_dir: Path, args) -> int:
                 "offer_redemption_url": brand.get("website", ""),
                 "reward_image_url": "",
                 "reward_bgcolor_code": o.get("bg_colour", ""),
-                "translation_short_description": brand.get("scraped_meta", ""),
-                "translation_description": "",
+                "translation_short_description": meta_desc,
+                "translation_description": scraped_text,
                 "translation_how_to_redeem": "",
                 "translation_terms_and_conditions": "",
                 # Pipeline internal columns
