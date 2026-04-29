@@ -3186,15 +3186,32 @@ def _finalize(out_dir: Path, args) -> int:
                 will_upscale = outcome["upscaled"]
 
                 if not will_monochromize and not will_upscale:
-                    # No pixel manipulation required → preserve original format if it's
-                    # in the allowed set (PNG/JPG/JPEG/WEBP). Convert to PNG otherwise.
-                    dest, used_ext = _copy_or_convert(source_path, dest_subdir, safe)
+                    # No upscale/recolour/monochrome — but still pad to a square canvas
+                    # so all assets ship at consistent dimensions. Preserve WebP format
+                    # (it supports alpha); everything else becomes PNG (covers JPEG, AVIF,
+                    # etc. — converting JPEG → PNG also preserves any alpha we add).
+                    from PIL import Image as _PILImage
+                    raw_ext = (cand.get("raw_format") or source_path.suffix.lstrip(".") or "png").lower()
+                    img = _PILImage.open(source_path).convert("RGBA")
+                    padded = _proc_pad_to_square(img, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                    if raw_ext == "webp":
+                        dest = dest_subdir / f"{safe}.webp"
+                        try:
+                            padded.save(dest, format="WEBP", lossless=True)
+                        except Exception:
+                            # Some PIL builds have flaky WebP write — fall back to PNG
+                            dest = dest_subdir / f"{safe}.png"
+                            padded.save(dest, format="PNG", optimize=True)
+                    else:
+                        dest = dest_subdir / f"{safe}.png"
+                        padded.save(dest, format="PNG", optimize=True)
                     outcome["output_file"] = str(dest.relative_to(final_root))
                     outcome["status"] = "ok"
+                    # 'passthrough' here means: no upscale/recolour/monochrome was requested.
+                    # The asset still got padded to square — that's a baseline transformation
+                    # applied to every raster for catalogue uniformity.
                     outcome["passthrough"] = True
-                    # If we converted (raw was non-allowed), it's not strictly passthrough,
-                    # but we still skipped recolour/monochromize/upscale.
-                    if used_ext == "png" and (cand.get("raw_format") or "").lower() not in ALLOWED_OUTPUT_EXTS:
+                    if raw_ext not in ALLOWED_OUTPUT_EXTS:
                         outcome["converted_format"] = True
                 else:
                     # Pixel manipulation needed → convert to PNG (alpha-aware, lossless for our ops)
