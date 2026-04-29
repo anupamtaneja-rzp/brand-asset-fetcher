@@ -158,10 +158,27 @@ def upscale_if_needed(
         except Exception as e:
             log.debug(f"[upscaler] Cache lookup failed: {e}")
 
+    # Upscayl/realesrgan-ncnn-vulkan only accepts PNG/JPG/WEBP as input.
+    # For other formats (AVIF, GIF, BMP, TIFF, ICO), convert to PNG via PIL first.
+    SUPPORTED_INPUT_FMTS = {"PNG", "JPEG", "JPG", "WEBP"}
+    actual_input = input_path
+    converted_temp: Path | None = None
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(input_path) as probe:
+            src_fmt = (probe.format or "").upper()
+        if src_fmt and src_fmt not in SUPPORTED_INPUT_FMTS:
+            converted_temp = input_path.with_name(input_path.stem + "._upscale_input.png")
+            _PILImage.open(input_path).convert("RGBA").save(converted_temp, "PNG")
+            actual_input = converted_temp
+            log.debug(f"[upscaler] Converted {src_fmt} → PNG for Upscayl: {input_path.name}")
+    except Exception as e:
+        log.debug(f"[upscaler] Format probe/convert failed for {input_path.name}: {e}; using original")
+
     # Run upscaler
     cmd = [
         binary,
-        "-i", str(input_path),
+        "-i", str(actual_input),
         "-o", str(output_path),
         "-s", str(scale),
         "-n", model,
@@ -206,3 +223,10 @@ def upscale_if_needed(
     except Exception as e:
         log.warning(f"[upscaler] Unexpected error on {input_path.name}: {e}")
         return input_path
+    finally:
+        # Clean up temp PNG conversion file if we made one
+        if converted_temp is not None:
+            try:
+                converted_temp.unlink()
+            except Exception:
+                pass
