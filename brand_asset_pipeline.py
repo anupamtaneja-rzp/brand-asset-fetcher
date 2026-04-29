@@ -110,8 +110,9 @@ CANDIDATE_CAP = 50        # max candidates per brand
 TARGET_SIZE = 500         # legacy: minimum output size (used by old process_logo)
 
 # v7 processor config
-PADDING_PX = 12           # pixels of padding around logo on the square canvas
-CANVAS_SIZE = 512         # output canvas size (px) for finalized assets
+PADDING_PCT = 12.0        # padding as % of canvas size (12 = 12% on each side)
+PADDING_PX = None         # optional absolute pixel override; None = use percent
+CANVAS_SIZE = 512         # output canvas size (px) for normalized previews
 UPSCALE_THRESHOLD = 500   # rasters with min(w,h) below this get upscaled in --finalize
 UPSCALE_MODEL = "digital-art-4x"  # Upscayl model; tuned for logos/line art
 UPSCALE_SCALE = 4
@@ -2800,7 +2801,7 @@ def process_brand(brand_name: str, website: str,
     # Save SVG if we have it (for SVG primaries, also save as logo.svg)
     if logo_data.get("svg_data"):
         if HAS_PROCESSORS:
-            squared_svg = _proc_normalize_svg(logo_data["svg_data"], padding_px=PADDING_PX, canvas_size=CANVAS_SIZE)
+            squared_svg = _proc_normalize_svg(logo_data["svg_data"], padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=CANVAS_SIZE)
         else:
             squared_svg = make_svg_square(logo_data["svg_data"])
         (brand_dir / "logo.svg").write_bytes(squared_svg)
@@ -2841,7 +2842,7 @@ def process_brand(brand_name: str, website: str,
             raw_filepath.write_bytes(svg_data)
 
             if HAS_PROCESSORS:
-                normalized_svg = _proc_normalize_svg(svg_data, padding_px=PADDING_PX, canvas_size=CANVAS_SIZE)
+                normalized_svg = _proc_normalize_svg(svg_data, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=CANVAS_SIZE)
             else:
                 normalized_svg = make_svg_square(svg_data)
             filename = f"{idx:02d}_{source_slug}.svg"
@@ -2896,7 +2897,7 @@ def process_brand(brand_name: str, website: str,
 
             # Save normalized preview (auto-size canvas, lossless padding) — always PNG
             if HAS_PROCESSORS:
-                processed_raster = _proc_pad_to_square(raster_img, padding_px=PADDING_PX, canvas_size=None)
+                processed_raster = _proc_pad_to_square(raster_img, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=None)
             else:
                 processed_raster = process_logo(raster_img)
             filename = f"{idx:02d}_{source_slug}.png"
@@ -2978,6 +2979,118 @@ def _flag_folder(reason: str | None) -> str:
     if not reason:
         return "final"
     return f"flagged_{reason.replace('-', '_')}"
+
+
+def _prep_upscale(out_dir: Path, args) -> int:
+    """
+    Build a flat folder of files to upscale manually in Upscayl's batch UI.
+    """
+    summary_path = out_dir / "pipeline_summary.json"
+    session_path = out_dir / "review_session.json"
+    if not summary_path.exists() or not session_path.exists():
+        print(f"  ❌ Missing pipeline_summary.json or review_session.json in {out_dir}")
+        return 1
+
+    summary = json.loads(summary_path.read_text())
+    session = json.loads(session_path.read_text())
+    force_upscale = set(session.get("forceUpscale", []) or [])
+    if not force_upscale:
+        print(f"  ⚠️  forceUpscale list is empty — no brands marked for upscaling.")
+        return 0
+
+    by_folder = {}
+    for r in summary:
+        folder = r.get("folder") or _safe_name(r.get("brand_name", ""))
+        by_folder[folder] = r
+
+    pending_dir = out_dir / "_upscale_pending"
+    if pending_dir.exists():
+        import shutil as _sh
+        _sh.rmtree(pending_dir)
+    pending_dir.mkdir(parents=True)
+
+    UPSCAYL_OK_EXTS = {"png", "jpg", "jpeg", "webp"}
+    prepped, skipped = 0, []
+
+    for folder in sorted(force_upscale):
+        brand = by_folder.get(folder)
+        if not brand:
+            skipped.append((folder, "not in pipeline_summary.json"))
+            continue
+        cands = brand.get("logo_candidates") or []
+        sel_idx = (session.get("selectedLogos") or {}).get(folder)
+        cand = None
+        if sel_idx is not None and 0 <= int(sel_idx) < len(cands):
+            cand = cands[int(sel_idx)]
+        if cand is None:
+            for c in cands:
+                if c.get("is_selected") and not c.get("is_svg"):
+                    cand = c; break
+        if cand is None:
+            cand = next((c for c in cands if not c.get("is_svg")), None)
+        if cand is None or cand.get("is_svg"):
+            skipped.append((folder, "no raster candidate"))
+            continue
+
+        raw_rel = cand.get("raw_file") or cand.get("file") or ""
+        raw_path = out_dir / folder / raw_rel
+        if not raw_path.exists():
+            skipped.append((folder, f"raw file missing: {raw_path.name}"))
+            continue
+
+        src_ext = raw_path.suffix.lstrip(".").lower()
+        if src_ext not in UPSCAYL_OK_EXTS:
+            try:
+                from PIL import Image as _PILImage
+                _PILImage.open(raw_path).convert("RGBA").save(pending_dir / f"{folder}.png", "PNG")
+                prepped += 1
+            except Exception as e:
+                skipped.append((folder, f"could not convert {src_ext} → PNG: {e}"))
+        else:
+            import shutil as _sh
+            _sh.copyfile(raw_path, pending_dir / f"{folder}.{src_ext}")
+            prepped += 1
+
+    done_dir = out_dir / "_upscale_done"
+    print(f"\n{'=' * 60}")
+    print(f"  PREP-UPSCALE — {prepped} files ready")
+    print(f"  Pending folder: {pending_dir.absolute()}")
+    print(f"{'=' * 60}\n")
+    if skipped:
+        print(f"  ⚠️  Skipped {len(skipped)} brands:")
+        for folder, reason in skipped[:10]:
+            print(f"     - {folder}: {reason}")
+        if len(skipped) > 10:
+            print(f"     ... and {len(skipped) - 10} more")
+        print()
+    print(f"  Next steps:")
+    print(f"  1. Open Upscayl")
+    print(f"  2. Switch to 'Batch Upscayl' mode (top toggle)")
+    print(f"  3. Click 'Select Folder' and pick:")
+    print(f"        {pending_dir.absolute()}")
+    print(f"  4. Set output folder to:")
+    print(f"        {done_dir.absolute()}")
+    print(f"     (create it if it doesn't exist)")
+    print(f"  5. Select model: 'Digital Art 4x' (best for logos)")
+    print(f"  6. Click 'Upscayl' and wait")
+    print(f"  7. When done, run:")
+    print(f"        python brand_asset_pipeline.py --finalize {out_dir.name} --upscale --threads 4")
+    print(f"     The pipeline will detect upscaled files in _upscale_done/ and use them.")
+    return 0
+
+
+def _find_manual_upscale(out_dir: Path, folder_slug: str) -> Path | None:
+    """Look in _upscale_done/ for a user-upscaled file matching folder_slug."""
+    done_dir = out_dir / "_upscale_done"
+    if not done_dir.is_dir():
+        return None
+    for f in sorted(done_dir.iterdir()):
+        if not f.is_file():
+            continue
+        stem = f.stem
+        if stem == folder_slug or stem.startswith(folder_slug + "_") or stem.startswith(folder_slug + "."):
+            return f
+    return None
 
 
 def _finalize(out_dir: Path, args) -> int:
@@ -3133,7 +3246,7 @@ def _finalize(out_dir: Path, args) -> int:
             if cand.get("is_svg"):
                 # ─── SVG path ─────────────────────────────────
                 svg_bytes = raw_path.read_bytes()
-                svg_bytes = _proc_normalize_svg(svg_bytes, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                svg_bytes = _proc_normalize_svg(svg_bytes, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
 
                 hex_col = logo_recolours.get(folder, "").strip()
                 if hex_col:
@@ -3156,27 +3269,35 @@ def _finalize(out_dir: Path, args) -> int:
 
                 # Upscale ONLY if reviewer explicitly opted in
                 if args.upscale and folder in force_upscale:
-                    try:
-                        with PILImage.open(source_path) as probe:
-                            min_dim = min(probe.size)
-                        # User opted in — upscale even if technically above threshold (their choice)
-                        staging = final_root / f"_upscale_in_{safe}.png"
-                        up = _proc_upscale_if_needed(
-                            source_path,
-                            output_path=staging,
-                            threshold=10**9,  # disable internal threshold; user already opted in
-                            scale=UPSCALE_SCALE,
-                            model=args.upscale_model,
-                            binary_override=args.upscayl_bin,
-                            cache_dir=upscale_cache,
-                        )
-                        if up != source_path and Path(up).exists():
-                            source_path = Path(up)
-                            outcome["upscaled"] = True
-                        else:
-                            outcome["warnings"].append("Upscale opted-in but binary unavailable or failed")
-                    except Exception as e:
-                        outcome["warnings"].append(f"Upscale error: {e}")
+                    # FIRST: check if user did manual upscale via Upscayl batch UI.
+                    # If _upscale_done/<folder>.* exists, use that (skip Upscayl subprocess).
+                    manual_up = _find_manual_upscale(out_dir, folder)
+                    if manual_up:
+                        source_path = manual_up
+                        outcome["upscaled"] = True
+                        outcome["upscaled_via"] = "manual"
+                    else:
+                        try:
+                            with PILImage.open(source_path) as probe:
+                                min_dim = min(probe.size)
+                            staging = final_root / f"_upscale_in_{safe}.png"
+                            up = _proc_upscale_if_needed(
+                                source_path,
+                                output_path=staging,
+                                threshold=10**9,
+                                scale=UPSCALE_SCALE,
+                                model=args.upscale_model,
+                                binary_override=args.upscayl_bin,
+                                cache_dir=upscale_cache,
+                            )
+                            if up != source_path and Path(up).exists():
+                                source_path = Path(up)
+                                outcome["upscaled"] = True
+                                outcome["upscaled_via"] = "auto"
+                            else:
+                                outcome["warnings"].append("Upscale opted-in but binary unavailable or failed")
+                        except Exception as e:
+                            outcome["warnings"].append(f"Upscale error: {e}")
                 elif folder in force_upscale and not args.upscale:
                     outcome["warnings"].append("Upscale opted-in but --upscale flag not passed")
 
@@ -3193,7 +3314,7 @@ def _finalize(out_dir: Path, args) -> int:
                     from PIL import Image as _PILImage
                     raw_ext = (cand.get("raw_format") or source_path.suffix.lstrip(".") or "png").lower()
                     img = _PILImage.open(source_path).convert("RGBA")
-                    padded = _proc_pad_to_square(img, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                    padded = _proc_pad_to_square(img, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
                     if raw_ext == "webp":
                         dest = dest_subdir / f"{safe}.webp"
                         try:
@@ -3219,7 +3340,7 @@ def _finalize(out_dir: Path, args) -> int:
                     if will_monochromize:
                         img = _proc_monochromize(img, mono)
                         outcome["monochrome"] = mono
-                    final_img = _proc_pad_to_square(img, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                    final_img = _proc_pad_to_square(img, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
                     dest = dest_subdir / f"{safe}.png"
                     final_img.save(dest, format="PNG", optimize=True)
                     outcome["output_file"] = str(dest.relative_to(final_root))
@@ -3451,14 +3572,23 @@ def main():
     parser.add_argument("--port", type=int, default=4200,
                         help="Port for the review server (default: 4200)")
     # v7 flags
-    parser.add_argument("--padding", type=int, default=12,
-                        help="Pixels of padding around the logo on the square canvas (default: 12)")
+    # Padding: now expressed as percentage of canvas (default 12% per side).
+    # Old --padding flag kept as alias.
+    parser.add_argument("--padding-pct", "--padding", type=float, default=12.0,
+                        dest="padding_pct",
+                        help="Padding as percentage of canvas size on each side (default: 12 = 12%%). "
+                             "On a 1024 canvas this is ~123px. Pass --padding-px for absolute pixels.")
+    parser.add_argument("--padding-px", type=int, default=None,
+                        help="Absolute padding override in pixels (overrides --padding-pct).")
     parser.add_argument("--canvas-size", type=int, default=512,
                         help="Output canvas size for normalized assets (default: 512)")
     parser.add_argument("--final-canvas-size", type=int, default=1024,
                         help="Output canvas size for --finalize (default: 1024)")
     parser.add_argument("--finalize", metavar="DIR",
                         help="Run Phase 3 (Pass 2) on a sourced+reviewed folder. Reads review_session.json from DIR.")
+    parser.add_argument("--prep-upscale", metavar="DIR", dest="prep_upscale",
+                        help="Build _upscale_pending/ folder for manual batch processing in Upscayl's UI. "
+                             "Run this, upscale the files manually, then run --finalize to incorporate the results.")
     parser.add_argument("--upscale", action="store_true",
                         help="Enable Upscayl 4x upscaling for rasters under --upscale-threshold (Phase 3 only)")
     parser.add_argument("--no-upscale", action="store_true",
@@ -3473,8 +3603,9 @@ def main():
     args = parser.parse_args()
 
     # Apply v7 globals from args
-    global PADDING_PX, CANVAS_SIZE, FINAL_CANVAS_SIZE, UPSCALE_THRESHOLD, UPSCALE_MODEL, UPSCAYL_BIN
-    PADDING_PX = args.padding
+    global PADDING_PCT, PADDING_PX, CANVAS_SIZE, FINAL_CANVAS_SIZE, UPSCALE_THRESHOLD, UPSCALE_MODEL, UPSCAYL_BIN
+    PADDING_PCT = args.padding_pct
+    PADDING_PX = args.padding_px
     CANVAS_SIZE = args.canvas_size
     FINAL_CANVAS_SIZE = args.final_canvas_size
     UPSCALE_THRESHOLD = args.upscale_threshold
@@ -3484,6 +3615,14 @@ def main():
     # If --no-upscale explicitly set, force upscale off
     if args.no_upscale:
         args.upscale = False
+
+    # --prep-upscale mode: build _upscale_pending/ folder for manual batch processing
+    if args.prep_upscale:
+        out = Path(args.prep_upscale)
+        if not out.exists():
+            print(f"  Error: {out} not found.")
+            sys.exit(1)
+        sys.exit(_prep_upscale(out, args))
 
     # --finalize mode: run Pass 2 on existing output folder
     if args.finalize:

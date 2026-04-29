@@ -59,18 +59,20 @@ def _content_bbox_alpha(arr: np.ndarray, alpha_threshold: int = 10) -> Tuple[int
 
 def pad_to_square(
     img: Image.Image,
-    padding_px: int = 12,
+    padding_pct: float = 12.0,
     canvas_size: int | None = None,
     background: Tuple[int, int, int, int] = (0, 0, 0, 0),
+    padding_px: int | None = None,
 ) -> Image.Image:
     """
     Trim transparent borders, then centre the content on a square canvas.
 
-    - padding_px: pixels of breathing room between content edge and canvas edge
-    - canvas_size: if given, output is exactly this size (px) and content scales
-                   to fit canvas - 2*padding_px. If None, canvas auto-sizes
-                   to max(content_w, content_h) + 2*padding_px.
+    - padding_pct: percentage of canvas size for each side's padding (default 12 = 12%)
+                   On a 1024 canvas, padding_pct=12 → ~123px padding per side.
+                   On auto-size canvas, padding is 12% of content's max dimension.
+    - canvas_size: if given, output is exactly this size (px). Otherwise auto-sized.
     - background: RGBA fill for the canvas (default fully transparent)
+    - padding_px: optional absolute override (advanced use). Wins over padding_pct.
 
     Returns RGBA image.
     """
@@ -88,18 +90,25 @@ def pad_to_square(
         return img
 
     if canvas_size is not None:
-        # Fixed output size — scale content to fit (canvas_size - 2*padding_px)
-        inner = max(canvas_size - 2 * padding_px, 1)
+        # Fixed output size — pad is percentage of canvas (or absolute override)
+        if padding_px is None:
+            pad = int(round(canvas_size * padding_pct / 100))
+        else:
+            pad = padding_px
+        inner = max(canvas_size - 2 * pad, 1)
         scale = min(inner / cw, inner / ch)
         new_w = max(int(round(cw * scale)), 1)
         new_h = max(int(round(ch * scale)), 1)
-        # Use LANCZOS for downscale, NEAREST_LIKE for upscale via LANCZOS too (no quality loss vs upscale separately)
         cropped = cropped.resize((new_w, new_h), Image.LANCZOS)
         cw, ch = new_w, new_h
         size = canvas_size
     else:
-        # Auto-size canvas
-        size = max(cw, ch) + 2 * padding_px
+        # Auto-size canvas: padding scales with content size
+        if padding_px is None:
+            pad = int(round(max(cw, ch) * padding_pct / 100))
+        else:
+            pad = padding_px
+        size = max(cw, ch) + 2 * pad
 
     canvas = Image.new("RGBA", (size, size), background)
     paste_x = (size - cw) // 2

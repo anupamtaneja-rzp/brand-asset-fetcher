@@ -153,8 +153,9 @@ def _get_existing_viewbox(root) -> Tuple[float, float, float, float] | None:
 
 def normalize_svg(
     svg_bytes: bytes,
-    padding_px: int = 12,
+    padding_pct: float = 12.0,
     canvas_size: int = 512,
+    padding_px: int | None = None,
 ) -> bytes:
     """
     Compute content bbox, expand to square + padding, rewrite viewBox.
@@ -214,11 +215,14 @@ def normalize_svg(
     cx -= (side - cw) / 2
     cy -= (side - ch) / 2
 
-    # Add padding — convert padding_px on a canvas_size canvas to user units
-    # padding_in_user_units / side = padding_px / (canvas_size - 2*padding_px)
-    # → padding_in_user_units = side * padding_px / (canvas_size - 2*padding_px)
-    inner = max(canvas_size - 2 * padding_px, 1)
-    pad_user = side * (padding_px / inner)
+    # Resolve padding: pct of canvas (default), unless absolute padding_px override
+    if padding_px is None:
+        pad = int(round(canvas_size * padding_pct / 100))
+    else:
+        pad = padding_px
+    # Convert padding (in canvas-size pixels) to SVG user units
+    inner = max(canvas_size - 2 * pad, 1)
+    pad_user = side * (pad / inner)
 
     new_x = cx - pad_user
     new_y = cy - pad_user
