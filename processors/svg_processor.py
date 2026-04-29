@@ -88,18 +88,37 @@ def _strip_namespace(tag: str) -> str:
 
 def _content_bbox_via_cairosvg(svg_bytes: bytes, render_size: int = 1024) -> Tuple[float, float, float, float] | None:
     """
-    Render the SVG to a high-res PNG via cairosvg, find non-transparent bbox,
-    return as fractions (x_pct, y_pct, w_pct, h_pct) of the render size.
+    Render the SVG to a PNG via cairosvg, find non-transparent bbox,
+    return as fractions (x_pct, y_pct, w_pct, h_pct) of the rendered viewBox area.
+
+    Renders the SVG at output dims proportional to its viewBox aspect ratio,
+    so cairosvg's preserveAspectRatio="meet" letterboxing doesn't insert empty
+    bands top/bottom (or left/right) and break the percent → user-units mapping.
 
     Returns None if rendering fails or no content.
     """
     if not HAS_CAIROSVG:
         return None
     try:
+        # Determine viewBox aspect to render proportionally (no letterbox)
+        render_w, render_h = render_size, render_size
+        try:
+            root = _parse(svg_bytes)
+            vb = _get_existing_viewbox(root)
+            if vb:
+                vw, vh = vb[2], vb[3]
+                if vw > 0 and vh > 0:
+                    if vw >= vh:
+                        render_h = max(int(round(render_size * vh / vw)), 1)
+                    else:
+                        render_w = max(int(round(render_size * vw / vh)), 1)
+        except Exception:
+            pass  # Fall back to square render
+
         png_bytes = cairosvg.svg2png(
             bytestring=svg_bytes,
-            output_width=render_size,
-            output_height=render_size,
+            output_width=render_w,
+            output_height=render_h,
         )
         img = Image.open(BytesIO(png_bytes)).convert("RGBA")
         arr = np.array(img)

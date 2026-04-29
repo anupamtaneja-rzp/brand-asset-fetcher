@@ -768,8 +768,8 @@ def tier3_wikimedia(brand_name: str) -> dict | None:
             hits = data.get("query", {}).get("search", [])
             for hit in hits:
                 title = hit.get("title", "")
-                # Only want SVG files or high-quality PNGs
-                if not any(title.lower().endswith(ext) for ext in [".svg", ".png"]):
+                # Allow SVG plus common raster formats (WebP, JPEG, AVIF)
+                if not any(title.lower().endswith(ext) for ext in [".svg", ".png", ".jpg", ".jpeg", ".webp", ".avif"]):
                     continue
                 # Skip if title suggests it's not a logo (e.g. "Map of...", "Photo of...")
                 title_lower = title.lower()
