@@ -57,6 +57,22 @@ try:
 except ImportError:
     HAS_CAIROSVG = False
 
+# New v7 processors (padding/squaring/recolour/upscale)
+try:
+    from processors import (
+        pad_to_square as _proc_pad_to_square,
+        monochromize as _proc_monochromize,
+        normalize_svg as _proc_normalize_svg,
+        recolour_svg as _proc_recolour_svg,
+        is_svg as _proc_is_svg,
+        upscale_if_needed as _proc_upscale_if_needed,
+        is_upscayl_available as _proc_is_upscayl_available,
+        auto_detect_upscayl_bin as _proc_auto_detect_upscayl_bin,
+    )
+    HAS_PROCESSORS = True
+except ImportError:
+    HAS_PROCESSORS = False
+
 # Check playwright availability once at startup
 try:
     from playwright.sync_api import sync_playwright
@@ -91,7 +107,16 @@ OUT_DIR = Path("./brand_assets")
 REMBG_MODEL = "u2net"
 ALPHA_MATTING = False
 CANDIDATE_CAP = 50        # max candidates per brand
-TARGET_SIZE = 500         # minimum output size (upscale if below)
+TARGET_SIZE = 500         # legacy: minimum output size (used by old process_logo)
+
+# v7 processor config
+PADDING_PX = 12           # pixels of padding around logo on the square canvas
+CANVAS_SIZE = 512         # output canvas size (px) for finalized assets
+UPSCALE_THRESHOLD = 500   # rasters with min(w,h) below this get upscaled in --finalize
+UPSCALE_MODEL = "realesrgan-x4plus-anime"
+UPSCALE_SCALE = 4
+UPSCAYL_BIN = None        # auto-detect if None
+FINAL_CANVAS_SIZE = 1024  # final output canvas in --finalize (post-upscale)
 
 # ─── SAFE JSON ENCODER ─────────────────────────────────────────────────────────
 
@@ -1735,6 +1760,8 @@ const CATEGORIES = {categories_json};
 
 let finalized = new Set();
 let flagged = {{}};  // folder -> reason string (folder -> reason)
+let logoMonochrome = {{}};  // folder -> "black" | "white" | "" (rasters only)
+let skipUpscale = new Set();  // folders flagged to skip upscaling
 let selectedColours = {{}};
 let selectedLogos = {{}};   // folder -> candidate index
 let logoRecolours = {{}};
@@ -1826,6 +1853,65 @@ function _applyRecolour(svg, hex) {{
   return svg;
 }}
 
+// ─── RASTER MONOCHROMIZE (lossless: preserves alpha channel) ───
+// Returns a Promise<dataURL> with R/G/B replaced and alpha preserved.
+function _applyMonochromeRaster(srcDataUrl, mode) {{
+  return new Promise((resolve, reject) => {{
+    if (!mode || mode === "none" || mode === "original") {{
+      resolve(srcDataUrl);
+      return;
+    }}
+    const img = new Image();
+    img.onload = () => {{
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth || img.width;
+      c.height = img.naturalHeight || img.height;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const imgData = ctx.getImageData(0, 0, c.width, c.height);
+      const d = imgData.data;
+      const v = (mode === "white") ? 255 : 0;
+      for (let i = 0; i < d.length; i += 4) {{
+        d[i] = v; d[i+1] = v; d[i+2] = v; // alpha (i+3) untouched
+      }}
+      ctx.putImageData(imgData, 0, 0);
+      resolve(c.toDataURL("image/png"));
+    }};
+    img.onerror = () => resolve(srcDataUrl);
+    img.src = srcDataUrl;
+  }});
+}}
+
+function setLogoMonochrome(folder, mode) {{
+  if (!mode || mode === "none" || mode === "original") {{
+    delete logoMonochrome[folder];
+  }} else {{
+    logoMonochrome[folder] = mode;
+  }}
+  // Refresh detail panel preview without rebuilding
+  const b = BRANDS.find(x => x.folder === folder);
+  if (b) {{
+    const cand = _getEffectiveCandidate(b);
+    if (cand && !cand.is_svg && cand.thumb_b64) {{
+      const src = "data:image/png;base64," + cand.thumb_b64;
+      _applyMonochromeRaster(src, logoMonochrome[folder]).then(url => {{
+        const img = document.querySelector("#detailPanel .detail-preview img");
+        if (img) img.src = url;
+      }});
+    }}
+  }}
+  renderGrid();
+}}
+
+function toggleSkipUpscale(folder) {{
+  if (skipUpscale.has(folder)) skipUpscale.delete(folder);
+  else skipUpscale.add(folder);
+  // Refresh badge in detail panel
+  const el = document.getElementById("skipUpscaleLabel_" + folder);
+  if (el) el.textContent = skipUpscale.has(folder) ? "Will skip upscaling" : "Will upscale 4x at finalize";
+  renderGrid();
+}}
+
 function toggleFinal(folder, evt) {{
   if (evt) evt.stopPropagation();
   if (finalized.has(folder)) finalized.delete(folder); else finalized.add(folder);
@@ -1887,13 +1973,13 @@ function openDetail(folder) {{
   const hasSvg = _getActiveSvgMarkup(b).length > 0;
   const recolourHex = logoRecolours[b.folder] || "";
 
-  // Preview: show recoloured SVG if applicable, else PNG
+  // Preview: show recoloured SVG if applicable, else PNG (with optional monochrome silhouette)
   let previewContent = "";
   if (hasSvg && recolourHex) {{
     const rc = _applyRecolour(_getActiveSvgMarkup(b), recolourHex);
     previewContent = `<img src="data:image/png;base64,${{getActiveLogo(b)}}" style="display:none"><div class="svg-overlay" style="display:flex">${{rc}}</div>`;
   }} else {{
-    previewContent = `<img src="data:image/png;base64,${{getActiveLogo(b)}}"><div class="svg-overlay" style="display:none"></div>`;
+    previewContent = `<img id="rasterPreview_${{b.folder}}" src="data:image/png;base64,${{getActiveLogo(b)}}"><div class="svg-overlay" style="display:none"></div>`;
   }}
 
   // Logo candidates picker
@@ -1919,7 +2005,7 @@ function openDetail(folder) {{
     logoPicker = `<p style="font-size:11px;color:#999;">Single logo found (run with --multi for options)</p>`;
   }}
 
-  // Recolour section
+  // Recolour section (SVG)
   let recolourSection = "";
   if (hasSvg) {{
     recolourSection = `<div class="recolour-section">
@@ -1929,6 +2015,44 @@ function openDetail(folder) {{
         <button onclick="recolourSVG('${{b.folder}}','#FFFFFF')">White</button>
         <button onclick="recolourSVG('${{b.folder}}','#000000')">Black</button>
         <button onclick="resetLogoColour('${{b.folder}}')">Reset</button>
+      </div>
+    </div>`;
+  }}
+
+  // Monochrome section (rasters only — alpha-preserving lossless silhouette)
+  let monoSection = "";
+  const effCand = _getEffectiveCandidate(b);
+  if (effCand && !effCand.is_svg) {{
+    const curMono = logoMonochrome[b.folder] || "";
+    const sel = (v) => curMono === v ? "selected" : "";
+    monoSection = `<div class="recolour-section">
+      <h4>Logo colour (raster)</h4>
+      <div class="recolour-controls" style="gap:6px;">
+        <select onchange="setLogoMonochrome('${{b.folder}}',this.value)" style="padding:5px 8px;border-radius:4px;border:1px solid #ccc;">
+          <option value="" ${{sel("")}}>Original</option>
+          <option value="black" ${{sel("black")}}>Black silhouette</option>
+          <option value="white" ${{sel("white")}}>White silhouette</option>
+        </select>
+        <span style="font-size:10px;color:#888;">Lossless — preserves edges</span>
+      </div>
+    </div>`;
+  }}
+
+  // Skip-upscale toggle (only for rasters that need upscaling)
+  let upscaleSection = "";
+  if (effCand && !effCand.is_svg && effCand.needs_upscale) {{
+    const skipped = skipUpscale.has(b.folder);
+    upscaleSection = `<div class="recolour-section" style="background:#fff8e1;">
+      <h4 style="color:#f57c00;">Upscaling</h4>
+      <div style="font-size:11px;color:#666;margin-bottom:6px;">
+        Source: ${{effCand.original_size || "?"}} → will become ${{effCand.original_min_dim ? Math.round(effCand.original_min_dim * 4) : "?"}}px after 4x upscale
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+        <input type="checkbox" ${{skipped ? "checked" : ""}} onchange="toggleSkipUpscale('${{b.folder}}')">
+        Skip upscaling (keep original resolution)
+      </label>
+      <div id="skipUpscaleLabel_${{b.folder}}" style="font-size:11px;color:#888;margin-top:4px;">
+        ${{skipped ? "Will skip upscaling" : "Will upscale 4x at finalize"}}
       </div>
     </div>`;
   }}
@@ -1964,6 +2088,8 @@ function openDetail(folder) {{
         </div>
         ${{colourHtml}}
         ${{recolourSection}}
+        ${{monoSection}}
+        ${{upscaleSection}}
       </div>
       <div class="detail-right">
         <div class="detail-info">
@@ -1983,6 +2109,17 @@ function openDetail(folder) {{
     </div>`;
 
   document.getElementById("detailOverlay").classList.add("open");
+
+  // Apply monochrome to the preview if previously set (raster only)
+  const curMono = logoMonochrome[b.folder];
+  if (curMono && effCand && !effCand.is_svg) {{
+    const previewImg = document.getElementById("rasterPreview_" + b.folder);
+    if (previewImg) {{
+      _applyMonochromeRaster(previewImg.src, curMono).then(url => {{
+        previewImg.src = url;
+      }});
+    }}
+  }}
 }}
 
 function closeDetail() {{
@@ -2038,6 +2175,15 @@ function renderGrid() {{
     if (b.bg_removed) badges += `<span class="badge badge-rembg">BG Rem</span> `;
     if (b.undersize) badges += `<span class="badge badge-undersize">Upscaled</span> `;
     if (b.logo_issues && b.logo_issues.length) badges += `<span class="badge badge-logoissue" title="${{b.logo_issues.join(', ')}}">!</span> `;
+    // Resolution badge (rasters only — show original dim)
+    const _ec = _getEffectiveCandidate(b);
+    if (_ec && !_ec.is_svg && _ec.original_min_dim) {{
+      const willUpscale = _ec.needs_upscale && !skipUpscale.has(b.folder);
+      const cls = _ec.original_min_dim < 200 ? "badge-undersize" : "";
+      const arrow = willUpscale ? " ↑4x" : "";
+      badges += `<span class="badge ${{cls}}" title="Original min dimension">${{_ec.original_min_dim}}px${{arrow}}</span> `;
+    }}
+    if (logoMonochrome[b.folder]) badges += `<span class="badge" style="background:${{logoMonochrome[b.folder]==='black'?'#222':'#fff'}};color:${{logoMonochrome[b.folder]==='black'?'#fff':'#333'}};border:1px solid #ccc;">${{logoMonochrome[b.folder]}}</span> `;
     const candCount = (b.logo_candidates && b.logo_candidates.length > 1) ? `<span class="badge" style="background:#f0f0f0;color:#333;">${{b.logo_candidates.length}} opts</span> ` : "";
 
     let swatches = `<span class="label">BG:</span>`;
@@ -2095,13 +2241,15 @@ function renderGrid() {{
 // ─── SAVE / LOAD SESSION ───
 function saveSession() {{
   const session = {{
-    version: 1,
+    version: 2,
     saved_at: new Date().toISOString(),
     finalized: Array.from(finalized),
     flagged: {{ ...flagged }},
     selectedLogos: {{ ...selectedLogos }},
     logoRecolours: {{ ...logoRecolours }},
     selectedColours: {{ ...selectedColours }},
+    logoMonochrome: {{ ...logoMonochrome }},
+    skipUpscale: Array.from(skipUpscale),
   }};
   const blob = new Blob([JSON.stringify(session, null, 2)], {{type: "application/json"}});
   const a = document.createElement("a");
@@ -2124,6 +2272,8 @@ function loadSession(event) {{
       selectedLogos = session.selectedLogos || {{}};
       logoRecolours = session.logoRecolours || {{}};
       selectedColours = session.selectedColours || {{}};
+      logoMonochrome = session.logoMonochrome || {{}};
+      skipUpscale = new Set(session.skipUpscale || []);
       // Re-render
       renderGrid();
       document.getElementById("exportStatus").textContent = `Session loaded (${{finalized.size}} finalized, ${{Object.keys(flagged).length}} flagged)`;
@@ -2598,12 +2748,21 @@ def process_brand(brand_name: str, website: str,
 
     # Save SVG if we have it (for SVG primaries, also save as logo.svg)
     if logo_data.get("svg_data"):
-        squared_svg = make_svg_square(logo_data["svg_data"])
+        if HAS_PROCESSORS:
+            squared_svg = _proc_normalize_svg(logo_data["svg_data"], padding_px=PADDING_PX, canvas_size=CANVAS_SIZE)
+        else:
+            squared_svg = make_svg_square(logo_data["svg_data"])
         (brand_dir / "logo.svg").write_bytes(squared_svg)
 
-    # Save all logo candidates to candidates/ subfolder
+    # Save all logo candidates to candidates/ subfolder.
+    # We save TWO files per raster candidate:
+    #   - raw/<idx>_<source>.<ext>   → untouched original (used by --finalize)
+    #   - <idx>_<source>.<ext>       → normalized preview (used by review UI)
+    # SVGs save once (normalized version is also the source of truth for finalize).
     candidates_dir = brand_dir / "candidates"
     candidates_dir.mkdir(exist_ok=True)
+    raw_dir = candidates_dir / "raw"
+    raw_dir.mkdir(exist_ok=True)
 
     saved_candidates = []
     for idx, cand in enumerate(logo_candidates):
@@ -2624,38 +2783,66 @@ def process_brand(brand_name: str, website: str,
 
         # Save candidate file
         if is_svg and cand.get("svg_data"):
-            # SVG candidate: apply make_svg_square() and save
+            # SVG candidate: save raw + normalized
             svg_data = cand["svg_data"]
-            squared_svg = make_svg_square(svg_data)
+            raw_filename = f"{idx:02d}_{source_slug}.svg"
+            raw_filepath = raw_dir / raw_filename
+            raw_filepath.write_bytes(svg_data)
+
+            if HAS_PROCESSORS:
+                normalized_svg = _proc_normalize_svg(svg_data, padding_px=PADDING_PX, canvas_size=CANVAS_SIZE)
+            else:
+                normalized_svg = make_svg_square(svg_data)
             filename = f"{idx:02d}_{source_slug}.svg"
             filepath = candidates_dir / filename
-            filepath.write_bytes(squared_svg)
+            filepath.write_bytes(normalized_svg)
+
             cand_info["file"] = f"candidates/{filename}"
+            cand_info["raw_file"] = f"candidates/raw/{raw_filename}"
             cand_info["size"] = "vector"
+            cand_info["original_size"] = "vector"
+            cand_info["needs_upscale"] = False  # SVGs never need upscaling
 
             # Embed SVG markup for inline rendering + recolouring in HTML
             try:
-                svg_text = squared_svg.decode("utf-8", errors="replace") if isinstance(squared_svg, bytes) else squared_svg
+                svg_text = normalized_svg.decode("utf-8", errors="replace") if isinstance(normalized_svg, bytes) else normalized_svg
                 if "<svg" in svg_text.lower() and len(svg_text) < 200_000:
                     cand_info["svg_markup"] = svg_text
             except Exception:
                 pass
 
             # Create thumbnail by rasterizing the SVG
-            thumb_img = _svg_to_pil(squared_svg, 400)
+            thumb_img = _svg_to_pil(normalized_svg, 400)
             if thumb_img:
                 buf = BytesIO()
                 thumb_img.save(buf, format="PNG")
                 cand_info["thumb_b64"] = base64.b64encode(buf.getvalue()).decode()
         elif cand.get("image"):
-            # Raster candidate: apply process_logo() and save
-            raster_img = cand["image"].copy()
-            processed_raster = process_logo(raster_img)
+            # Raster candidate: save raw original + normalized preview
+            raster_img = cand["image"].copy().convert("RGBA")
+            orig_w, orig_h = raster_img.size
+
+            # Save raw (untouched) for finalize pass to re-process from source
+            raw_filename = f"{idx:02d}_{source_slug}.png"
+            raw_filepath = raw_dir / raw_filename
+            raster_img.save(raw_filepath)
+
+            # Save normalized preview (auto-size canvas, lossless padding)
+            if HAS_PROCESSORS:
+                # Auto-size canvas (no scale-up) — keeps preview lossless
+                processed_raster = _proc_pad_to_square(raster_img, padding_px=PADDING_PX, canvas_size=None)
+            else:
+                processed_raster = process_logo(raster_img)
             filename = f"{idx:02d}_{source_slug}.png"
             filepath = candidates_dir / filename
             processed_raster.save(filepath)
+
             cand_info["file"] = f"candidates/{filename}"
+            cand_info["raw_file"] = f"candidates/raw/{raw_filename}"
             cand_info["size"] = f"{processed_raster.width}x{processed_raster.height}"
+            cand_info["original_size"] = f"{orig_w}x{orig_h}"
+            cand_info["original_min_dim"] = min(orig_w, orig_h)
+            cand_info["needs_upscale"] = min(orig_w, orig_h) < UPSCALE_THRESHOLD
 
             # Create thumbnail
             thumb = processed_raster.copy()
@@ -2674,6 +2861,353 @@ def process_brand(brand_name: str, website: str,
         json.dump({k: v for k, v in result.items() if k != "image"}, f, indent=2, cls=SafeEncoder)
 
     return result
+
+
+# ─── FINALIZE (Pass 2) ───────────────────────────────────────────────────────
+
+def _safe_name(s: str) -> str:
+    """Filename-safe version of a brand name."""
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", s).strip("_") or "brand"
+
+
+def _flag_folder(reason: str | None) -> str:
+    """Map a flag reason to its destination subfolder."""
+    if not reason:
+        return "final"
+    return f"flagged_{reason.replace('-', '_')}"
+
+
+def _finalize(out_dir: Path, args) -> int:
+    """
+    Pass 2: read review_session.json + pipeline_summary.json, run upscale + DOM
+    recolour + monochromize + final padding, write production ZIP.
+
+    Returns 0 on success, non-zero on failure.
+    """
+    if not HAS_PROCESSORS:
+        print("  ❌ Processors module not available. Cannot run --finalize.")
+        return 1
+
+    summary_path = out_dir / "pipeline_summary.json"
+    session_path = out_dir / "review_session.json"
+
+    if not summary_path.exists():
+        print(f"  ❌ {summary_path} not found. Run sourcing pipeline first.")
+        return 1
+    if not session_path.exists():
+        print(f"  ❌ {session_path} not found.")
+        print(f"     In the review UI, click 'Save Session' and move the downloaded JSON")
+        print(f"     into '{out_dir}/' before running --finalize.")
+        return 1
+
+    # Wire up logging
+    _setup_file_logging(out_dir, args.log_level)
+    log.info(f"=== FINALIZE START on {out_dir} ===")
+
+    summary = json.loads(summary_path.read_text())
+    session = json.loads(session_path.read_text())
+
+    finalized_set = set(session.get("finalized", []))
+    flagged_map = session.get("flagged", {}) or {}
+    selected_logos = session.get("selectedLogos", {}) or {}
+    logo_recolours = session.get("logoRecolours", {}) or {}
+    logo_monochrome = session.get("logoMonochrome", {}) or {}
+    skip_upscale = set(session.get("skipUpscale", []) or [])
+
+    # Build a dict folder → brand result
+    by_folder = {}
+    for r in summary:
+        folder = r.get("folder") or _safe_name(r.get("brand_name", ""))
+        by_folder[folder] = r
+
+    # Determine which brands to process
+    to_process = []
+    for folder, brand in by_folder.items():
+        if folder in finalized_set:
+            to_process.append((folder, brand, flagged_map.get(folder)))
+        elif folder in flagged_map:
+            to_process.append((folder, brand, flagged_map[folder]))
+
+    print(f"\n{'='*60}")
+    print(f"  FINALIZE — Processing {len(to_process)} brands")
+    print(f"  Source:    {out_dir.absolute()}")
+    print(f"  Padding:   {PADDING_PX}px  Canvas: {FINAL_CANVAS_SIZE}x{FINAL_CANVAS_SIZE}")
+    upscale_status = "ON" if args.upscale else "OFF"
+    if args.upscale:
+        bin_path = _proc_auto_detect_upscayl_bin(args.upscayl_bin)
+        if bin_path:
+            upscale_status = f"ON ({bin_path})"
+        else:
+            upscale_status = "ON (binary NOT FOUND — will skip)"
+            print(f"  ⚠️  Upscayl binary not found. Install via brew or upscayl.org.")
+            print(f"     Rasters will keep their original resolution.")
+    print(f"  Upscale:   {upscale_status}")
+    print(f"{'='*60}\n")
+
+    # Build the "raw" inputs we'll re-process from
+    final_root = out_dir / "_finalize_staging"
+    if final_root.exists():
+        import shutil
+        shutil.rmtree(final_root)
+    final_root.mkdir(parents=True)
+
+    # Cache dir for upscaler
+    upscale_cache = out_dir / "_upscale_cache"
+
+    report_lines = []
+    csv_rows = []
+    not_processed = []
+    completed = 0
+
+    def _process_one(folder: str, brand: dict, flag: str | None) -> dict:
+        """Process a single finalized/flagged brand. Returns row for CSV."""
+        nonlocal completed
+        brand_name = brand.get("brand_name", folder)
+        brand_dir = out_dir / folder
+        candidates = brand.get("logo_candidates") or []
+        outcome = {"folder": folder, "brand_name": brand_name, "flag": flag, "warnings": []}
+
+        # Pick the effective candidate
+        cand = None
+        sel_idx = selected_logos.get(folder)
+        if sel_idx is not None and 0 <= int(sel_idx) < len(candidates):
+            cand = candidates[int(sel_idx)]
+        if cand is None:
+            for c in candidates:
+                if c.get("is_selected"):
+                    cand = c
+                    break
+        if cand is None and candidates:
+            cand = candidates[0]
+        if cand is None:
+            outcome["warnings"].append("No candidate available")
+            outcome["status"] = "skipped"
+            return outcome
+
+        outcome["source_tier"] = cand.get("tier")
+        outcome["source_name"] = cand.get("source")
+        outcome["is_svg"] = bool(cand.get("is_svg"))
+        outcome["original_size"] = cand.get("original_size", "")
+
+        # Resolve raw file path; fall back to processed file if raw missing
+        raw_rel = cand.get("raw_file") or cand.get("file")
+        if not raw_rel:
+            outcome["warnings"].append("No file path on candidate")
+            outcome["status"] = "skipped"
+            return outcome
+        raw_path = brand_dir / Path(raw_rel).name if "/" not in raw_rel else (out_dir.parent / Path(raw_rel) if raw_rel.startswith("/") else (brand_dir.parent / raw_rel.replace(brand_dir.name + "/", "", 1) if raw_rel.startswith(brand_dir.name + "/") else brand_dir / raw_rel))
+        # Simpler: relative paths in summary are relative to brand_dir
+        raw_path = brand_dir / raw_rel
+        if not raw_path.exists():
+            # Try processed file as fallback
+            fallback = brand_dir / (cand.get("file") or "")
+            if fallback.exists():
+                raw_path = fallback
+                outcome["warnings"].append(f"raw_file missing, using processed: {cand.get('file')}")
+            else:
+                outcome["warnings"].append(f"File not found: {raw_path}")
+                outcome["status"] = "failed"
+                return outcome
+
+        # Destination
+        dest_subdir = final_root / _flag_folder(flag)
+        dest_subdir.mkdir(parents=True, exist_ok=True)
+        safe = _safe_name(brand_name)
+
+        try:
+            if cand.get("is_svg"):
+                # ─── SVG path ─────────────────────────────────
+                svg_bytes = raw_path.read_bytes()
+                svg_bytes = _proc_normalize_svg(svg_bytes, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+
+                hex_col = logo_recolours.get(folder, "").strip()
+                if hex_col:
+                    svg_bytes = _proc_recolour_svg(svg_bytes, hex_col)
+                    outcome["recolour"] = hex_col
+
+                dest = dest_subdir / f"{safe}.svg"
+                dest.write_bytes(svg_bytes)
+                outcome["output_file"] = str(dest.relative_to(final_root))
+                outcome["status"] = "ok"
+                outcome["upscaled"] = False
+
+            else:
+                # ─── Raster path ──────────────────────────────
+                from PIL import Image as PILImage
+
+                source_path = raw_path
+                outcome["upscaled"] = False
+
+                # Upscale if needed
+                if args.upscale and folder not in skip_upscale:
+                    try:
+                        with PILImage.open(source_path) as probe:
+                            min_dim = min(probe.size)
+                        if min_dim < args.upscale_threshold:
+                            staging = final_root / f"_upscale_in_{safe}.png"
+                            up = _proc_upscale_if_needed(
+                                source_path,
+                                output_path=staging,
+                                threshold=args.upscale_threshold,
+                                scale=UPSCALE_SCALE,
+                                model=args.upscale_model,
+                                binary_override=args.upscayl_bin,
+                                cache_dir=upscale_cache,
+                            )
+                            if up != source_path and Path(up).exists():
+                                source_path = Path(up)
+                                outcome["upscaled"] = True
+                            else:
+                                outcome["warnings"].append("Upscale skipped or failed")
+                    except Exception as e:
+                        outcome["warnings"].append(f"Upscale error: {e}")
+
+                # Open source for processing
+                img = PILImage.open(source_path).convert("RGBA")
+
+                # Apply monochromize if requested
+                mono = logo_monochrome.get(folder, "").strip().lower()
+                if mono and mono not in ("none", "original"):
+                    img = _proc_monochromize(img, mono)
+                    outcome["monochrome"] = mono
+
+                # Pad to final canvas
+                final_img = _proc_pad_to_square(img, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+
+                dest = dest_subdir / f"{safe}.png"
+                final_img.save(dest, format="PNG", optimize=True)
+                outcome["output_file"] = str(dest.relative_to(final_root))
+                outcome["status"] = "ok"
+
+            outcome["bg_colour"] = (session.get("selectedColours") or {}).get(folder, "")
+
+        except Exception as e:
+            log.exception(f"[finalize] {folder} failed")
+            outcome["status"] = "failed"
+            outcome["warnings"].append(f"Exception: {e}")
+
+        return outcome
+
+    # Run (parallel-safe — most ops are independent)
+    if args.threads > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as pool:
+            outcomes = list(pool.map(lambda x: _process_one(*x), to_process))
+    else:
+        outcomes = []
+        for triple in to_process:
+            outcomes.append(_process_one(*triple))
+
+    # Print + collect report
+    for o in outcomes:
+        completed += 1
+        status_icon = {"ok": "✅", "failed": "❌", "skipped": "⏭️"}.get(o.get("status"), "?")
+        flag_str = f" [{o['flag']}]" if o.get("flag") else ""
+        upscale_str = " ↑4x" if o.get("upscaled") else ""
+        recolour_str = f" 🎨{o['recolour']}" if o.get("recolour") else ""
+        mono_str = f" ⬛{o['monochrome']}" if o.get("monochrome") else ""
+        warn = f"  ⚠️ {'; '.join(o['warnings'])}" if o.get("warnings") else ""
+        print(f"[{completed:3d}/{len(outcomes)}] {o['brand_name']:30s} {status_icon}{flag_str}{upscale_str}{recolour_str}{mono_str}{warn}")
+
+        report_lines.append(json.dumps(o, ensure_ascii=False))
+
+        if o.get("status") == "ok":
+            brand = by_folder.get(o["folder"], {})
+            csv_rows.append({
+                "category_display_name": brand.get("category", ""),
+                "brand_name": brand.get("brand_name", ""),
+                "brand_description": brand.get("scraped_meta", ""),
+                "brand_url": brand.get("website", ""),
+                "brand_logo_url": Path(o["output_file"]).name,
+                "brand_background_colour": o.get("bg_colour", ""),
+                "reward_display_name": brand.get("brand_name", ""),
+                "offer_redemption_channel": "",
+                "offer_redemption_url": brand.get("website", ""),
+                "reward_image_url": "",
+                "reward_bgcolor_code": o.get("bg_colour", ""),
+                "translation_short_description": brand.get("scraped_meta", ""),
+                "translation_description": "",
+                "translation_how_to_redeem": "",
+                "translation_terms_and_conditions": "",
+                # Pipeline internal columns
+                "flag_reason": o.get("flag", ""),
+                "logo_format": "svg" if o.get("is_svg") else "png",
+                "logo_recolour": o.get("recolour", ""),
+                "logo_monochrome": o.get("monochrome", ""),
+                "upscaled": "yes" if o.get("upscaled") else "no",
+                "source_tier": o.get("source_tier", ""),
+                "source_name": o.get("source_name", ""),
+                "original_size": o.get("original_size", ""),
+            })
+
+    # Remaining (non-finalized + non-flagged) brands
+    for folder, brand in by_folder.items():
+        if folder not in finalized_set and folder not in flagged_map:
+            not_processed.append({
+                "brand_name": brand.get("brand_name", ""),
+                "folder": folder,
+                "status": brand.get("status", ""),
+                "errors": "; ".join(brand.get("errors", []) or []),
+                "candidates_count": brand.get("logo_candidates_count", 0),
+            })
+
+    # Write CSV
+    csv_path = final_root / "brand_data.csv"
+    if csv_rows:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+
+    # Write JSON
+    json_path = final_root / "brand_data.json"
+    json_path.write_text(json.dumps(csv_rows, indent=2, ensure_ascii=False))
+
+    # Write remaining_brands.csv
+    if not_processed:
+        rem_path = final_root / "remaining_brands.csv"
+        with open(rem_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(not_processed[0].keys()))
+            writer.writeheader()
+            writer.writerows(not_processed)
+
+    # Write finalize_report.txt
+    report_path = final_root / "finalize_report.txt"
+    report_path.write_text(
+        f"Finalize Report — {out_dir.name}\n"
+        f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Total processed: {len(outcomes)}\n"
+        f"OK: {sum(1 for o in outcomes if o.get('status') == 'ok')}\n"
+        f"Failed: {sum(1 for o in outcomes if o.get('status') == 'failed')}\n"
+        f"Skipped: {sum(1 for o in outcomes if o.get('status') == 'skipped')}\n"
+        f"Upscaled: {sum(1 for o in outcomes if o.get('upscaled'))}\n"
+        f"Recoloured: {sum(1 for o in outcomes if o.get('recolour'))}\n"
+        f"Monochromized: {sum(1 for o in outcomes if o.get('monochrome'))}\n\n"
+        f"Per-brand JSON log:\n" + "\n".join(report_lines) + "\n"
+    )
+
+    # Build ZIP
+    import zipfile
+    zip_path = out_dir.parent / f"{out_dir.name}_final.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in final_root.rglob("*"):
+            if path.is_file():
+                zf.write(path, path.relative_to(final_root))
+
+    # Cleanup staging upscale files (cache stays for re-use)
+    for fp in final_root.glob("_upscale_in_*.png"):
+        try:
+            fp.unlink()
+        except Exception:
+            pass
+
+    print(f"\n{'='*60}")
+    print(f"  FINALIZE COMPLETE")
+    print(f"  ZIP:    {zip_path.absolute()}")
+    print(f"  Stage:  {final_root.absolute()}  (kept for inspection)")
+    print(f"  Report: {report_path.absolute()}")
+    print(f"{'='*60}\n")
+    log.info(f"=== FINALIZE END ===")
+    return 0
 
 
 def _start_review_server(directory: Path, port: int = 4200):
@@ -2738,7 +3272,47 @@ def main():
                         help="Skip auto-starting the review server after pipeline run")
     parser.add_argument("--port", type=int, default=4200,
                         help="Port for the review server (default: 4200)")
+    # v7 flags
+    parser.add_argument("--padding", type=int, default=12,
+                        help="Pixels of padding around the logo on the square canvas (default: 12)")
+    parser.add_argument("--canvas-size", type=int, default=512,
+                        help="Output canvas size for normalized assets (default: 512)")
+    parser.add_argument("--final-canvas-size", type=int, default=1024,
+                        help="Output canvas size for --finalize (default: 1024)")
+    parser.add_argument("--finalize", metavar="DIR",
+                        help="Run Phase 3 (Pass 2) on a sourced+reviewed folder. Reads review_session.json from DIR.")
+    parser.add_argument("--upscale", action="store_true",
+                        help="Enable Upscayl 4x upscaling for rasters under --upscale-threshold (Phase 3 only)")
+    parser.add_argument("--no-upscale", action="store_true",
+                        help="Explicitly disable upscaling (overrides --upscale)")
+    parser.add_argument("--upscale-threshold", type=int, default=500,
+                        help="Min dim (px) below which a raster gets upscaled (default: 500)")
+    parser.add_argument("--upscale-model", default="realesrgan-x4plus-anime",
+                        help="Upscayl model name (default: realesrgan-x4plus-anime)")
+    parser.add_argument("--upscayl-bin", default=None,
+                        help="Override path to realesrgan-ncnn-vulkan binary if auto-detect fails")
     args = parser.parse_args()
+
+    # Apply v7 globals from args
+    global PADDING_PX, CANVAS_SIZE, FINAL_CANVAS_SIZE, UPSCALE_THRESHOLD, UPSCALE_MODEL, UPSCAYL_BIN
+    PADDING_PX = args.padding
+    CANVAS_SIZE = args.canvas_size
+    FINAL_CANVAS_SIZE = args.final_canvas_size
+    UPSCALE_THRESHOLD = args.upscale_threshold
+    UPSCALE_MODEL = args.upscale_model
+    UPSCAYL_BIN = args.upscayl_bin
+
+    # If --no-upscale explicitly set, force upscale off
+    if args.no_upscale:
+        args.upscale = False
+
+    # --finalize mode: run Pass 2 on existing output folder
+    if args.finalize:
+        out = Path(args.finalize)
+        if not out.exists():
+            print(f"  Error: {out} not found.")
+            sys.exit(1)
+        sys.exit(_finalize(out, args))
 
     # --serve mode: just start the server, no pipeline
     if args.serve:
@@ -2751,7 +3325,7 @@ def main():
 
     # Normal pipeline mode: --input is required
     if not args.input:
-        parser.error("--input is required (unless using --serve)")
+        parser.error("--input is required (unless using --serve or --finalize)")
 
 
     global OUT_DIR, REMBG_MODEL, ALPHA_MATTING
