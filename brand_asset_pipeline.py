@@ -117,7 +117,8 @@ UPSCALE_THRESHOLD = 500   # rasters with min(w,h) below this get upscaled in --f
 UPSCALE_MODEL = "digital-art-4x"  # Upscayl model; tuned for logos/line art
 UPSCALE_SCALE = 4
 UPSCAYL_BIN = None        # auto-detect if None
-FINAL_CANVAS_SIZE = 1024  # final output canvas in --finalize (post-upscale)
+FINAL_CANVAS_SIZE = 500   # target canvas for brands opted into upscale (forceUpscale)
+FINAL_CANVAS_CAP = 1024   # soft cap for non-upscaled brands (auto-size up to this)
 
 # ─── SAFE JSON ENCODER ─────────────────────────────────────────────────────────
 
@@ -3307,14 +3308,17 @@ def _finalize(out_dir: Path, args) -> int:
                 will_upscale = outcome["upscaled"]
 
                 if not will_monochromize and not will_upscale:
-                    # No upscale/recolour/monochrome — but still pad to a square canvas
-                    # so all assets ship at consistent dimensions. Preserve WebP format
-                    # (it supports alpha); everything else becomes PNG (covers JPEG, AVIF,
-                    # etc. — converting JPEG → PNG also preserves any alpha we add).
+                    # Non-upscaled brand: keep native resolution (auto-size canvas),
+                    # capped at FINAL_CANVAS_CAP. Reviewer judged this source good as-is —
+                    # we preserve its native fidelity, only scaling down if it exceeds
+                    # the soft cap.
                     from PIL import Image as _PILImage
                     raw_ext = (cand.get("raw_format") or source_path.suffix.lstrip(".") or "png").lower()
                     img = _PILImage.open(source_path).convert("RGBA")
-                    padded = _proc_pad_to_square(img, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                    padded = _proc_pad_to_square(
+                        img, padding_pct=PADDING_PCT, padding_px=PADDING_PX,
+                        canvas_size=None, canvas_size_cap=FINAL_CANVAS_CAP,
+                    )
                     if raw_ext == "webp":
                         dest = dest_subdir / f"{safe}.webp"
                         try:
@@ -3335,12 +3339,25 @@ def _finalize(out_dir: Path, args) -> int:
                     if raw_ext not in ALLOWED_OUTPUT_EXTS:
                         outcome["converted_format"] = True
                 else:
-                    # Pixel manipulation needed → convert to PNG (alpha-aware, lossless for our ops)
+                    # Pixel manipulation needed → PNG output (alpha-aware).
+                    # Sizing rule:
+                    #   - Upscaled brand → fixed FINAL_CANVAS_SIZE (default 500)
+                    #     (Upscayl's 4x output downscales cleanly to fit this)
+                    #   - Non-upscaled (e.g. monochromize-only) → native size, cap at FINAL_CANVAS_CAP
                     img = PILImage.open(source_path).convert("RGBA")
                     if will_monochromize:
                         img = _proc_monochromize(img, mono)
                         outcome["monochrome"] = mono
-                    final_img = _proc_pad_to_square(img, padding_pct=PADDING_PCT, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                    if will_upscale:
+                        final_img = _proc_pad_to_square(
+                            img, padding_pct=PADDING_PCT, padding_px=PADDING_PX,
+                            canvas_size=FINAL_CANVAS_SIZE,
+                        )
+                    else:
+                        final_img = _proc_pad_to_square(
+                            img, padding_pct=PADDING_PCT, padding_px=PADDING_PX,
+                            canvas_size=None, canvas_size_cap=FINAL_CANVAS_CAP,
+                        )
                     dest = dest_subdir / f"{safe}.png"
                     final_img.save(dest, format="PNG", optimize=True)
                     outcome["output_file"] = str(dest.relative_to(final_root))
@@ -3582,8 +3599,11 @@ def main():
                         help="Absolute padding override in pixels (overrides --padding-pct).")
     parser.add_argument("--canvas-size", type=int, default=512,
                         help="Output canvas size for normalized assets (default: 512)")
-    parser.add_argument("--final-canvas-size", type=int, default=1024,
-                        help="Output canvas size for --finalize (default: 1024)")
+    parser.add_argument("--final-canvas-size", type=int, default=500,
+                        help="Output canvas size for brands opted into upscale (default: 500). "
+                             "Non-upscaled brands ship at native resolution capped at --final-canvas-cap.")
+    parser.add_argument("--final-canvas-cap", type=int, default=1024,
+                        help="Soft cap for non-upscaled brands: max canvas size before LANCZOS downscale (default: 1024).")
     parser.add_argument("--finalize", metavar="DIR",
                         help="Run Phase 3 (Pass 2) on a sourced+reviewed folder. Reads review_session.json from DIR.")
     parser.add_argument("--prep-upscale", metavar="DIR", dest="prep_upscale",
@@ -3608,6 +3628,8 @@ def main():
     PADDING_PX = args.padding_px
     CANVAS_SIZE = args.canvas_size
     FINAL_CANVAS_SIZE = args.final_canvas_size
+    global FINAL_CANVAS_CAP
+    FINAL_CANVAS_CAP = args.final_canvas_cap
     UPSCALE_THRESHOLD = args.upscale_threshold
     UPSCALE_MODEL = args.upscale_model
     UPSCAYL_BIN = args.upscayl_bin

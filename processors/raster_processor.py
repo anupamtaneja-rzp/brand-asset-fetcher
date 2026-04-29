@@ -63,6 +63,7 @@ def pad_to_square(
     canvas_size: int | None = None,
     background: Tuple[int, int, int, int] = (0, 0, 0, 0),
     padding_px: int | None = None,
+    canvas_size_cap: int | None = None,
 ) -> Image.Image:
     """
     Trim transparent borders, then centre the content on a square canvas.
@@ -71,6 +72,10 @@ def pad_to_square(
                    On a 1024 canvas, padding_pct=12 → ~123px padding per side.
                    On auto-size canvas, padding is 12% of content's max dimension.
     - canvas_size: if given, output is exactly this size (px). Otherwise auto-sized.
+    - canvas_size_cap: only relevant when canvas_size is None. If the auto-size
+                       would exceed this value, downscale content + cap canvas at this size.
+                       Lets callers say "preserve native resolution, but don't ship anything
+                       bigger than 1024". Quality preserved via LANCZOS downscale.
     - background: RGBA fill for the canvas (default fully transparent)
     - padding_px: optional absolute override (advanced use). Wins over padding_pct.
 
@@ -109,6 +114,18 @@ def pad_to_square(
         else:
             pad = padding_px
         size = max(cw, ch) + 2 * pad
+
+        # Apply soft cap if it would exceed the limit
+        if canvas_size_cap is not None and size > canvas_size_cap:
+            size = canvas_size_cap
+            if padding_px is None:
+                pad = int(round(canvas_size_cap * padding_pct / 100))
+            inner = max(canvas_size_cap - 2 * pad, 1)
+            scale = min(inner / cw, inner / ch)
+            new_w = max(int(round(cw * scale)), 1)
+            new_h = max(int(round(ch * scale)), 1)
+            cropped = cropped.resize((new_w, new_h), Image.LANCZOS)
+            cw, ch = new_w, new_h
 
     canvas = Image.new("RGBA", (size, size), background)
     paste_x = (size - cw) // 2
