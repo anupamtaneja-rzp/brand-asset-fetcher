@@ -3171,6 +3171,27 @@ def _finalize(out_dir: Path, args) -> int:
                     outcome["output_file"] = str(dest.relative_to(final_root))
                     outcome["status"] = "ok"
 
+            # ─── Save the original (raw fetched file) for any modified brand ──
+            # Lets reviewer compare upscaled/recoloured/monochromized output vs the source.
+            # Skip for passthrough brands — final IS the original, no need to duplicate.
+            was_modified = bool(
+                outcome.get("upscaled") or outcome.get("recolour") or outcome.get("monochrome")
+            )
+            if was_modified and not outcome.get("passthrough"):
+                originals_dir = final_root / "originals"
+                originals_dir.mkdir(parents=True, exist_ok=True)
+                # Use the actual raw_path (untouched original from candidates/raw/)
+                raw_to_copy = brand_dir / (cand.get("raw_file") or "")
+                if raw_to_copy.exists():
+                    orig_ext = raw_to_copy.suffix.lstrip(".").lower() or "bin"
+                    orig_dest = originals_dir / f"{safe}.{orig_ext}"
+                    try:
+                        import shutil as _sh
+                        _sh.copyfile(raw_to_copy, orig_dest)
+                        outcome["original_file"] = str(orig_dest.relative_to(final_root))
+                    except Exception as e:
+                        outcome["warnings"].append(f"Could not copy original: {e}")
+
             outcome["bg_colour"] = (session.get("selectedColours") or {}).get(folder, "")
 
         except Exception as e:
@@ -3236,6 +3257,8 @@ def _finalize(out_dir: Path, args) -> int:
                 "source_tier": o.get("source_tier", ""),
                 "source_name": o.get("source_name", ""),
                 "original_size": o.get("original_size", ""),
+                # Path to the saved original (only present when brand was modified)
+                "original_logo_url": Path(o["original_file"]).name if o.get("original_file") else "",
                 # Passthrough from input CSV
                 "merchant_id": merchant_id,
                 "merchant_email": merchant_email,
@@ -3283,7 +3306,9 @@ def _finalize(out_dir: Path, args) -> int:
         f"Skipped: {sum(1 for o in outcomes if o.get('status') == 'skipped')}\n"
         f"Upscaled: {sum(1 for o in outcomes if o.get('upscaled'))}\n"
         f"Recoloured: {sum(1 for o in outcomes if o.get('recolour'))}\n"
-        f"Monochromized: {sum(1 for o in outcomes if o.get('monochrome'))}\n\n"
+        f"Monochromized: {sum(1 for o in outcomes if o.get('monochrome'))}\n"
+        f"Originals preserved: {sum(1 for o in outcomes if o.get('original_file'))}\n"
+        f"Passthrough (no modification): {sum(1 for o in outcomes if o.get('passthrough'))}\n\n"
         f"Per-brand JSON log:\n" + "\n".join(report_lines) + "\n"
     )
 
