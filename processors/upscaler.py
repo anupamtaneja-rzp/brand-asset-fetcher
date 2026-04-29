@@ -76,13 +76,38 @@ def is_upscayl_available(override: str | None = None) -> bool:
 
 # ─── MODELS ──────────────────────────────────────────────────────────────────
 
-# Models that ship with realesrgan-ncnn-vulkan
+# Default model names depend on the binary distribution:
+#   - Upscayl app bundle: digital-art-4x, upscayl-standard-4x, upscayl-lite-4x, ...
+#   - Vanilla realesrgan-ncnn-vulkan: realesrgan-x4plus, realesrgan-x4plus-anime, ...
+# digital-art-4x is the right pick for logos when running through Upscayl
+# (specifically tuned for line art / illustrations / typography).
 DEFAULT_MODELS = {
-    "realesrgan-x4plus": "Photo content; smooths edges (not ideal for logos)",
-    "realesrgan-x4plus-anime": "Line art / logos / typography — preserves crisp edges",
-    "realesrnet-x4plus": "More aggressive denoising",
-    "realesr-animevideov3-x4": "Animated content",
+    # Upscayl-bundled (preferred for our use case)
+    "digital-art-4x":         "Upscayl: line art / logos / typography — preserves crisp edges",
+    "upscayl-standard-4x":    "Upscayl: balanced general-purpose default",
+    "upscayl-lite-4x":        "Upscayl: faster, slightly lower fidelity",
+    "high-fidelity-4x":       "Upscayl: photographic content, max detail",
+    "ultramix-balanced":      "Upscayl: mixed content",
+    # Vanilla realesrgan
+    "realesrgan-x4plus":      "Vanilla: photo content (smooths edges)",
+    "realesrgan-x4plus-anime":"Vanilla: anime / line art",
 }
+
+
+def list_available_models(binary: str | None = None) -> list[str]:
+    """Inspect the binary's models/ directory and return available model names."""
+    bin_path = binary or auto_detect_upscayl_bin()
+    if not bin_path:
+        return []
+    # Models live next to the binary in a 'models/' folder, OR one level up in Resources/models/
+    candidates = [
+        Path(bin_path).parent / "models",
+        Path(bin_path).parent.parent / "models",
+    ]
+    for d in candidates:
+        if d.is_dir():
+            return sorted({p.stem for p in d.glob("*.bin")})
+    return []
 
 
 # ─── CACHE ───────────────────────────────────────────────────────────────────
@@ -106,7 +131,7 @@ def upscale_if_needed(
     output_path: Path | str | None = None,
     threshold: int = 500,
     scale: int = 4,
-    model: str = "realesrgan-x4plus-anime",
+    model: str = "digital-art-4x",
     binary_override: str | None = None,
     cache_dir: Path | str | None = None,
     timeout: int = 120,
@@ -138,6 +163,23 @@ def upscale_if_needed(
     if not binary:
         log.warning(f"[upscaler] Upscayl binary not found; skipping upscale of {input_path.name}")
         return input_path
+
+    # Validate model — Upscayl silently outputs garbage (often all-black) when the
+    # requested model isn't present. Detect this BEFORE running the binary.
+    available = list_available_models(binary)
+    if available and model not in available:
+        # Try sensible fallbacks in order
+        fallback_order = ["digital-art-4x", "upscayl-standard-4x", "upscayl-lite-4x",
+                          "realesrgan-x4plus-anime", "realesrgan-x4plus"]
+        chosen = next((m for m in fallback_order if m in available), None)
+        if chosen:
+            log.warning(f"[upscaler] Model {model!r} not found in {Path(binary).parent}; "
+                        f"falling back to {chosen!r}. Available: {', '.join(available)}")
+            model = chosen
+        else:
+            log.warning(f"[upscaler] Model {model!r} not found and no fallback available. "
+                        f"Available models: {', '.join(available)}. Skipping upscale of {input_path.name}.")
+            return input_path
 
     # Resolve output path
     if output_path is None:

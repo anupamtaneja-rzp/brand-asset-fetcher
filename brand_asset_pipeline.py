@@ -113,7 +113,7 @@ TARGET_SIZE = 500         # legacy: minimum output size (used by old process_log
 PADDING_PX = 12           # pixels of padding around logo on the square canvas
 CANVAS_SIZE = 512         # output canvas size (px) for finalized assets
 UPSCALE_THRESHOLD = 500   # rasters with min(w,h) below this get upscaled in --finalize
-UPSCALE_MODEL = "realesrgan-x4plus-anime"
+UPSCALE_MODEL = "digital-art-4x"  # Upscayl model; tuned for logos/line art
 UPSCALE_SCALE = 4
 UPSCAYL_BIN = None        # auto-detect if None
 FINAL_CANVAS_SIZE = 1024  # final output canvas in --finalize (post-upscale)
@@ -3448,8 +3448,9 @@ def main():
                         help="Explicitly disable upscaling (overrides --upscale)")
     parser.add_argument("--upscale-threshold", type=int, default=500,
                         help="Min dim (px) below which a raster gets upscaled (default: 500)")
-    parser.add_argument("--upscale-model", default="realesrgan-x4plus-anime",
-                        help="Upscayl model name (default: realesrgan-x4plus-anime)")
+    parser.add_argument("--upscale-model", default="digital-art-4x",
+                        help="Upscayl model name (default: digital-art-4x — tuned for logos/line art). "
+                             "Other options if running Upscayl: upscayl-standard-4x, upscayl-lite-4x, high-fidelity-4x")
     parser.add_argument("--upscayl-bin", default=None,
                         help="Override path to realesrgan-ncnn-vulkan binary if auto-detect fails")
     args = parser.parse_args()
