@@ -288,11 +288,35 @@ def recolour_svg(svg_bytes: bytes, hex_colour: str) -> bytes:
         return svg_bytes  # Return original if processing fails
 
 
+# Map PIL .format / response Content-Type to a clean filename extension
+_PIL_FMT_TO_EXT = {
+    "JPEG": "jpg", "JPG": "jpg", "PNG": "png", "WEBP": "webp",
+    "GIF": "gif", "BMP": "bmp", "TIFF": "tif", "AVIF": "avif", "ICO": "ico",
+}
+
+
+def _ext_from_content_type(ct: str) -> str | None:
+    """Best-effort extension from a Content-Type header. Returns None if unknown."""
+    ct = (ct or "").lower().split(";")[0].strip()
+    if "webp" in ct: return "webp"
+    if "jpeg" in ct or "jpg" in ct: return "jpg"
+    if "png" in ct: return "png"
+    if "gif" in ct: return "gif"
+    if "avif" in ct: return "avif"
+    if "bmp" in ct: return "bmp"
+    if "tiff" in ct: return "tif"
+    if "x-icon" in ct or "vnd.microsoft.icon" in ct: return "ico"
+    return None
+
+
 def _fetch_image(url: str, referer: str = "") -> tuple[Image.Image | None, bool, bytes | None]:
     """
     Download an image URL. Returns (PIL Image, is_svg, svg_raw_bytes).
-    svg_raw_bytes is set even if rasterization failed, so we can still save the SVG.
-    referer: optional Referer header (e.g. brand website) to help with CDN access.
+
+    For rasters, the original byte content + detected extension are stashed in
+    img.info under '__raw_bytes' and '__raw_ext' so the save loop can write the
+    raw original to disk without re-encoding (preserves WebP/JPEG/etc. as-is).
+    Image.copy() preserves the info dict so this survives the candidate flow.
     """
     # Fix protocol-relative URLs (//cdn.shopify.com/... → https://...)
     if url.startswith("//"):
@@ -309,7 +333,7 @@ def _fetch_image(url: str, referer: str = "") -> tuple[Image.Image | None, bool,
     if _is_svg_url(url):
         svg_data = _fetch_svg(url)
         if svg_data:
-            return None, True, svg_data  # Return SVG data without PIL Image
+            return None, True, svg_data
 
     try:
         resp = requests.get(url, headers=hdrs, timeout=TIMEOUT, stream=True)
@@ -324,14 +348,30 @@ def _fetch_image(url: str, referer: str = "") -> tuple[Image.Image | None, bool,
         # Check if response is SVG
         if "svg" in ct:
             svg_data = resp.content
-            return None, True, svg_data  # Return SVG data without rasterizing
+            return None, True, svg_data
         if "image" not in ct and "octet" not in ct:
             log.debug(f"[fetch] Unexpected content-type '{ct}' for {url[:80]}")
             return None, False, svg_data
-        img = Image.open(BytesIO(resp.content))
+        raw_bytes = resp.content
+        img = Image.open(BytesIO(raw_bytes))
         if img.width < MIN_LOGO_SIZE or img.height < MIN_LOGO_SIZE:
             log.debug(f"[fetch] Image too small ({img.width}x{img.height}) from {url[:80]}")
             return None, False, svg_data
+        # Determine extension: prefer PIL's detected format, fall back to Content-Type, then URL
+        ext = _PIL_FMT_TO_EXT.get((img.format or "").upper())
+        if not ext:
+            ext = _ext_from_content_type(ct)
+        if not ext:
+            url_path = urlparse(url).path.lower()
+            for known in ("webp", "jpg", "jpeg", "png", "gif", "avif", "bmp", "tif", "tiff", "ico"):
+                if url_path.endswith("." + known):
+                    ext = "jpg" if known == "jpeg" else ("tif" if known == "tiff" else known)
+                    break
+        if not ext:
+            ext = "png"  # safety fallback
+        # Stash raw bytes + extension on the Image so the save loop can preserve format
+        img.info["__raw_bytes"] = raw_bytes
+        img.info["__raw_ext"] = ext
         return img, False, svg_data
     except Exception as e:
         log.debug(f"[fetch] Exception fetching {url[:80]}: {e}")
@@ -1761,7 +1801,7 @@ const CATEGORIES = {categories_json};
 let finalized = new Set();
 let flagged = {{}};  // folder -> reason string (folder -> reason)
 let logoMonochrome = {{}};  // folder -> "black" | "white" | "" (rasters only)
-let skipUpscale = new Set();  // folders flagged to skip upscaling
+let forceUpscale = new Set();  // folders explicitly opted into 4x upscaling at finalize (default: empty = no upscale)
 let selectedColours = {{}};
 let selectedLogos = {{}};   // folder -> candidate index
 let logoRecolours = {{}};
@@ -1903,12 +1943,11 @@ function setLogoMonochrome(folder, mode) {{
   renderGrid();
 }}
 
-function toggleSkipUpscale(folder) {{
-  if (skipUpscale.has(folder)) skipUpscale.delete(folder);
-  else skipUpscale.add(folder);
-  // Refresh badge in detail panel
-  const el = document.getElementById("skipUpscaleLabel_" + folder);
-  if (el) el.textContent = skipUpscale.has(folder) ? "Will skip upscaling" : "Will upscale 4x at finalize";
+function toggleForceUpscale(folder) {{
+  if (forceUpscale.has(folder)) forceUpscale.delete(folder);
+  else forceUpscale.add(folder);
+  const el = document.getElementById("forceUpscaleLabel_" + folder);
+  if (el) el.textContent = forceUpscale.has(folder) ? "Will upscale 4x at finalize" : "Will keep original resolution";
   renderGrid();
 }}
 
@@ -2038,21 +2077,28 @@ function openDetail(folder) {{
     </div>`;
   }}
 
-  // Skip-upscale toggle (only for rasters that need upscaling)
+  // Upscale opt-in toggle (rasters only) — default OFF, reviewer marks what needs upscaling
   let upscaleSection = "";
-  if (effCand && !effCand.is_svg && effCand.needs_upscale) {{
-    const skipped = skipUpscale.has(b.folder);
-    upscaleSection = `<div class="recolour-section" style="background:#fff8e1;">
-      <h4 style="color:#f57c00;">Upscaling</h4>
+  if (effCand && !effCand.is_svg) {{
+    const forced = forceUpscale.has(b.folder);
+    const minDim = effCand.original_min_dim || 0;
+    const projected = minDim ? minDim * 4 : 0;
+    const eligible = !!effCand.upscale_eligible;
+    const hint = eligible
+      ? `Source is ${{effCand.original_size || "?"}}; recommended for upscale (logo is small).`
+      : `Source is ${{effCand.original_size || "?"}}; already high-res, upscaling optional.`;
+    const projectedTxt = projected ? ` Projected after 4x: ~${{projected}}px.` : "";
+    upscaleSection = `<div class="recolour-section" style="background:${{eligible ? '#fff8e1' : '#f4f6f8'}};">
+      <h4 style="color:${{eligible ? '#f57c00' : '#444'}};">Upscaling</h4>
       <div style="font-size:11px;color:#666;margin-bottom:6px;">
-        Source: ${{effCand.original_size || "?"}} → will become ${{effCand.original_min_dim ? Math.round(effCand.original_min_dim * 4) : "?"}}px after 4x upscale
+        ${{hint}}${{projectedTxt}}
       </div>
       <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
-        <input type="checkbox" ${{skipped ? "checked" : ""}} onchange="toggleSkipUpscale('${{b.folder}}')">
-        Skip upscaling (keep original resolution)
+        <input type="checkbox" ${{forced ? "checked" : ""}} onchange="toggleForceUpscale('${{b.folder}}')">
+        Upscale this logo 4x at finalize
       </label>
-      <div id="skipUpscaleLabel_${{b.folder}}" style="font-size:11px;color:#888;margin-top:4px;">
-        ${{skipped ? "Will skip upscaling" : "Will upscale 4x at finalize"}}
+      <div id="forceUpscaleLabel_${{b.folder}}" style="font-size:11px;color:#888;margin-top:4px;">
+        ${{forced ? "Will upscale 4x at finalize" : "Will keep original resolution"}}
       </div>
     </div>`;
   }}
@@ -2175,10 +2221,10 @@ function renderGrid() {{
     if (b.bg_removed) badges += `<span class="badge badge-rembg">BG Rem</span> `;
     if (b.undersize) badges += `<span class="badge badge-undersize">Upscaled</span> `;
     if (b.logo_issues && b.logo_issues.length) badges += `<span class="badge badge-logoissue" title="${{b.logo_issues.join(', ')}}">!</span> `;
-    // Resolution badge (rasters only — show original dim)
+    // Resolution badge (rasters only — show original dim, ↑4x only if reviewer opted in)
     const _ec = _getEffectiveCandidate(b);
     if (_ec && !_ec.is_svg && _ec.original_min_dim) {{
-      const willUpscale = _ec.needs_upscale && !skipUpscale.has(b.folder);
+      const willUpscale = forceUpscale.has(b.folder);
       const cls = _ec.original_min_dim < 200 ? "badge-undersize" : "";
       const arrow = willUpscale ? " ↑4x" : "";
       badges += `<span class="badge ${{cls}}" title="Original min dimension">${{_ec.original_min_dim}}px${{arrow}}</span> `;
@@ -2249,7 +2295,7 @@ function saveSession() {{
     logoRecolours: {{ ...logoRecolours }},
     selectedColours: {{ ...selectedColours }},
     logoMonochrome: {{ ...logoMonochrome }},
-    skipUpscale: Array.from(skipUpscale),
+    forceUpscale: Array.from(forceUpscale),
   }};
   const blob = new Blob([JSON.stringify(session, null, 2)], {{type: "application/json"}});
   const a = document.createElement("a");
@@ -2273,7 +2319,12 @@ function loadSession(event) {{
       logoRecolours = session.logoRecolours || {{}};
       selectedColours = session.selectedColours || {{}};
       logoMonochrome = session.logoMonochrome || {{}};
-      skipUpscale = new Set(session.skipUpscale || []);
+      // Backward compat: support old "skipUpscale" field by inverting (anything not skipped → forced)
+      if (session.forceUpscale) {{
+        forceUpscale = new Set(session.forceUpscale);
+      }} else {{
+        forceUpscale = new Set();
+      }}
       // Re-render
       renderGrid();
       document.getElementById("exportStatus").textContent = `Session loaded (${{finalized.size}} finalized, ${{Object.keys(flagged).length}} flagged)`;
@@ -2818,18 +2869,33 @@ def process_brand(brand_name: str, website: str,
                 thumb_img.save(buf, format="PNG")
                 cand_info["thumb_b64"] = base64.b64encode(buf.getvalue()).decode()
         elif cand.get("image"):
-            # Raster candidate: save raw original + normalized preview
-            raster_img = cand["image"].copy().convert("RGBA")
-            orig_w, orig_h = raster_img.size
+            # Raster candidate: save raw original (in original format!) + normalized preview
+            raw_img_for_dims = cand["image"]
+            orig_w, orig_h = raw_img_for_dims.size
 
-            # Save raw (untouched) for finalize pass to re-process from source
-            raw_filename = f"{idx:02d}_{source_slug}.png"
+            # Pull raw bytes + original extension from img.info (set by _fetch_image)
+            stashed_raw_bytes = raw_img_for_dims.info.get("__raw_bytes")
+            stashed_raw_ext = raw_img_for_dims.info.get("__raw_ext", "png")
+
+            # Save raw — bytes-for-bytes if available, else PIL save in original format
+            raw_filename = f"{idx:02d}_{source_slug}.{stashed_raw_ext}"
             raw_filepath = raw_dir / raw_filename
-            raster_img.save(raw_filepath)
+            if stashed_raw_bytes:
+                raw_filepath.write_bytes(stashed_raw_bytes)
+            else:
+                # Fallback (e.g. tier1 paths that craft images without _fetch_image)
+                pil_fmt = (raw_img_for_dims.format or "PNG").upper()
+                try:
+                    raw_img_for_dims.save(raw_filepath, format=pil_fmt)
+                except Exception:
+                    raw_img_for_dims.convert("RGBA").save(raw_filepath, format="PNG")
+                    raw_filename = f"{idx:02d}_{source_slug}.png"
 
-            # Save normalized preview (auto-size canvas, lossless padding)
+            # Convert to RGBA for the normalized preview (which always needs alpha)
+            raster_img = raw_img_for_dims.copy().convert("RGBA")
+
+            # Save normalized preview (auto-size canvas, lossless padding) — always PNG
             if HAS_PROCESSORS:
-                # Auto-size canvas (no scale-up) — keeps preview lossless
                 processed_raster = _proc_pad_to_square(raster_img, padding_px=PADDING_PX, canvas_size=None)
             else:
                 processed_raster = process_logo(raster_img)
@@ -2839,10 +2905,12 @@ def process_brand(brand_name: str, website: str,
 
             cand_info["file"] = f"candidates/{filename}"
             cand_info["raw_file"] = f"candidates/raw/{raw_filename}"
+            cand_info["raw_format"] = stashed_raw_ext
             cand_info["size"] = f"{processed_raster.width}x{processed_raster.height}"
             cand_info["original_size"] = f"{orig_w}x{orig_h}"
             cand_info["original_min_dim"] = min(orig_w, orig_h)
-            cand_info["needs_upscale"] = min(orig_w, orig_h) < UPSCALE_THRESHOLD
+            # Informational only — reviewer explicitly opts in via the UI
+            cand_info["upscale_eligible"] = min(orig_w, orig_h) < UPSCALE_THRESHOLD
 
             # Create thumbnail
             thumb = processed_raster.copy()
@@ -2907,12 +2975,24 @@ def _finalize(out_dir: Path, args) -> int:
     summary = json.loads(summary_path.read_text())
     session = json.loads(session_path.read_text())
 
+    # Optional: original input rows (for passthrough columns like merchant_id, merchant_email)
+    input_rows_path = out_dir / "input_rows.json"
+    input_rows_by_brand = {}
+    if input_rows_path.exists():
+        try:
+            input_rows_by_brand = json.loads(input_rows_path.read_text())
+        except Exception as e:
+            log.warning(f"Could not read input_rows.json: {e}")
+
     finalized_set = set(session.get("finalized", []))
     flagged_map = session.get("flagged", {}) or {}
     selected_logos = session.get("selectedLogos", {}) or {}
     logo_recolours = session.get("logoRecolours", {}) or {}
     logo_monochrome = session.get("logoMonochrome", {}) or {}
-    skip_upscale = set(session.get("skipUpscale", []) or [])
+    # New v7.2 model: explicit opt-in via forceUpscale. Backward-compat: if old
+    # skipUpscale field is present (no forceUpscale), treat absence-from-skipUpscale
+    # as "do not upscale" (i.e. ignore the old skipUpscale set entirely under new defaults).
+    force_upscale = set(session.get("forceUpscale", []) or [])
 
     # Build a dict folder → brand result
     by_folder = {}
@@ -3037,47 +3117,59 @@ def _finalize(out_dir: Path, args) -> int:
 
                 source_path = raw_path
                 outcome["upscaled"] = False
+                outcome["raw_format"] = cand.get("raw_format", source_path.suffix.lstrip(".") or "png")
 
-                # Upscale if needed
-                if args.upscale and folder not in skip_upscale:
+                # Upscale ONLY if reviewer explicitly opted in
+                if args.upscale and folder in force_upscale:
                     try:
                         with PILImage.open(source_path) as probe:
                             min_dim = min(probe.size)
-                        if min_dim < args.upscale_threshold:
-                            staging = final_root / f"_upscale_in_{safe}.png"
-                            up = _proc_upscale_if_needed(
-                                source_path,
-                                output_path=staging,
-                                threshold=args.upscale_threshold,
-                                scale=UPSCALE_SCALE,
-                                model=args.upscale_model,
-                                binary_override=args.upscayl_bin,
-                                cache_dir=upscale_cache,
-                            )
-                            if up != source_path and Path(up).exists():
-                                source_path = Path(up)
-                                outcome["upscaled"] = True
-                            else:
-                                outcome["warnings"].append("Upscale skipped or failed")
+                        # User opted in — upscale even if technically above threshold (their choice)
+                        staging = final_root / f"_upscale_in_{safe}.png"
+                        up = _proc_upscale_if_needed(
+                            source_path,
+                            output_path=staging,
+                            threshold=10**9,  # disable internal threshold; user already opted in
+                            scale=UPSCALE_SCALE,
+                            model=args.upscale_model,
+                            binary_override=args.upscayl_bin,
+                            cache_dir=upscale_cache,
+                        )
+                        if up != source_path and Path(up).exists():
+                            source_path = Path(up)
+                            outcome["upscaled"] = True
+                        else:
+                            outcome["warnings"].append("Upscale opted-in but binary unavailable or failed")
                     except Exception as e:
                         outcome["warnings"].append(f"Upscale error: {e}")
+                elif folder in force_upscale and not args.upscale:
+                    outcome["warnings"].append("Upscale opted-in but --upscale flag not passed")
 
-                # Open source for processing
-                img = PILImage.open(source_path).convert("RGBA")
-
-                # Apply monochromize if requested
+                # Decide whether we need to manipulate pixels at all
                 mono = logo_monochrome.get(folder, "").strip().lower()
-                if mono and mono not in ("none", "original"):
-                    img = _proc_monochromize(img, mono)
-                    outcome["monochrome"] = mono
+                will_monochromize = bool(mono and mono not in ("none", "original"))
+                will_upscale = outcome["upscaled"]
 
-                # Pad to final canvas
-                final_img = _proc_pad_to_square(img, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
-
-                dest = dest_subdir / f"{safe}.png"
-                final_img.save(dest, format="PNG", optimize=True)
-                outcome["output_file"] = str(dest.relative_to(final_root))
-                outcome["status"] = "ok"
+                if not will_monochromize and not will_upscale:
+                    # No pixel manipulation required → preserve original format byte-for-byte
+                    raw_ext = (cand.get("raw_format") or source_path.suffix.lstrip(".") or "png").lower()
+                    dest = dest_subdir / f"{safe}.{raw_ext}"
+                    import shutil as _sh
+                    _sh.copyfile(source_path, dest)
+                    outcome["output_file"] = str(dest.relative_to(final_root))
+                    outcome["status"] = "ok"
+                    outcome["passthrough"] = True
+                else:
+                    # Pixel manipulation needed → convert to PNG (alpha-aware, lossless for our ops)
+                    img = PILImage.open(source_path).convert("RGBA")
+                    if will_monochromize:
+                        img = _proc_monochromize(img, mono)
+                        outcome["monochrome"] = mono
+                    final_img = _proc_pad_to_square(img, padding_px=PADDING_PX, canvas_size=FINAL_CANVAS_SIZE)
+                    dest = dest_subdir / f"{safe}.png"
+                    final_img.save(dest, format="PNG", optimize=True)
+                    outcome["output_file"] = str(dest.relative_to(final_root))
+                    outcome["status"] = "ok"
 
             outcome["bg_colour"] = (session.get("selectedColours") or {}).get(folder, "")
 
@@ -3112,12 +3204,18 @@ def _finalize(out_dir: Path, args) -> int:
 
         if o.get("status") == "ok":
             brand = by_folder.get(o["folder"], {})
+            output_filename = Path(o["output_file"]).name
+            output_ext = Path(output_filename).suffix.lstrip(".").lower()
+            # Pass through extra columns from the original input CSV (merchant_id, merchant_email, etc.)
+            input_row = input_rows_by_brand.get(brand.get("brand_name", ""), {}) or {}
+            merchant_id = input_row.get("merchant_id", "") or input_row.get("Merchant ID", "")
+            merchant_email = input_row.get("merchant_email", "") or input_row.get("Merchant Email", "")
             csv_rows.append({
                 "category_display_name": brand.get("category", ""),
                 "brand_name": brand.get("brand_name", ""),
                 "brand_description": brand.get("scraped_meta", ""),
                 "brand_url": brand.get("website", ""),
-                "brand_logo_url": Path(o["output_file"]).name,
+                "brand_logo_url": output_filename,
                 "brand_background_colour": o.get("bg_colour", ""),
                 "reward_display_name": brand.get("brand_name", ""),
                 "offer_redemption_channel": "",
@@ -3130,13 +3228,17 @@ def _finalize(out_dir: Path, args) -> int:
                 "translation_terms_and_conditions": "",
                 # Pipeline internal columns
                 "flag_reason": o.get("flag", ""),
-                "logo_format": "svg" if o.get("is_svg") else "png",
+                "logo_format": output_ext or ("svg" if o.get("is_svg") else "png"),
                 "logo_recolour": o.get("recolour", ""),
                 "logo_monochrome": o.get("monochrome", ""),
                 "upscaled": "yes" if o.get("upscaled") else "no",
+                "passthrough": "yes" if o.get("passthrough") else "no",
                 "source_tier": o.get("source_tier", ""),
                 "source_name": o.get("source_name", ""),
                 "original_size": o.get("original_size", ""),
+                # Passthrough from input CSV
+                "merchant_id": merchant_id,
+                "merchant_email": merchant_email,
             })
 
     # Remaining (non-finalized + non-flagged) brands
@@ -3472,6 +3574,19 @@ def main():
     # Save summary JSON
     with open(OUT_DIR / "pipeline_summary.json", "w") as f:
         json.dump(results, f, indent=2, cls=SafeEncoder, default=str)
+
+    # Save full input rows (indexed by brand_name) so --finalize can pass through
+    # extra columns (merchant_id, merchant_email, etc.) into the final CSV.
+    try:
+        input_rows_by_brand = {}
+        for row in rows:
+            bn = (row.get(col_name) or "").strip()
+            if bn:
+                input_rows_by_brand[bn] = row
+        with open(OUT_DIR / "input_rows.json", "w", encoding="utf-8") as f:
+            json.dump(input_rows_by_brand, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"Could not save input_rows.json: {e}")
 
     # Save review CSV
     with open(OUT_DIR / "review.csv", "w", newline="") as f:
