@@ -3121,6 +3121,14 @@ def _finalize(out_dir: Path, args) -> int:
     _setup_file_logging(out_dir, args.log_level)
     log.info(f"=== FINALIZE START on {out_dir} ===")
 
+    # Flag reasons that should EXCLUDE a brand from the final ZIP entirely.
+    # These brands instead end up in remaining_brands.csv with their flag reason.
+    # 'wrong-logo' = the logo image isn't the brand's logo (re-source needed)
+    # 'wrong-colour' = the extracted brand colour is incorrect (manual fix needed)
+    # 'needs-upscaling' and 'other' still ship into flagged_*/ subfolders so engineering
+    # can decide what to do with them.
+    EXCLUDE_FROM_FINAL_FLAGS = {"wrong-logo", "wrong-colour"}
+
     summary = json.loads(summary_path.read_text())
     session = json.loads(session_path.read_text())
 
@@ -3149,16 +3157,26 @@ def _finalize(out_dir: Path, args) -> int:
         folder = r.get("folder") or _safe_name(r.get("brand_name", ""))
         by_folder[folder] = r
 
-    # Determine which brands to process
+    # Determine which brands to process. Any brand whose flag reason is in
+    # EXCLUDE_FROM_FINAL_FLAGS (wrong-logo, wrong-colour) is skipped here and
+    # falls through to remaining_brands.csv below.
     to_process = []
+    excluded_by_flag = []  # tracked for reporting
     for folder, brand in by_folder.items():
+        flag = flagged_map.get(folder)
+        if flag in EXCLUDE_FROM_FINAL_FLAGS:
+            excluded_by_flag.append((folder, brand, flag))
+            continue
         if folder in finalized_set:
-            to_process.append((folder, brand, flagged_map.get(folder)))
-        elif folder in flagged_map:
-            to_process.append((folder, brand, flagged_map[folder]))
+            to_process.append((folder, brand, flag))
+        elif flag:
+            to_process.append((folder, brand, flag))
 
     print(f"\n{'='*60}")
     print(f"  FINALIZE — Processing {len(to_process)} brands")
+    if excluded_by_flag:
+        print(f"  Excluded:  {len(excluded_by_flag)} brands flagged wrong-logo/wrong-colour "
+              f"(→ remaining_brands.csv)")
     print(f"  Source:    {out_dir.absolute()}")
     print(f"  Padding:   {PADDING_PX}px  Canvas: {FINAL_CANVAS_SIZE}x{FINAL_CANVAS_SIZE}")
     upscale_status = "ON" if args.upscale else "OFF"
@@ -3453,16 +3471,25 @@ def _finalize(out_dir: Path, args) -> int:
                 "merchant_email": merchant_email,
             })
 
-    # Remaining (non-finalized + non-flagged) brands
+    # Remaining brands: anything not in to_process. Includes:
+    #   1. Brands not finalized and not flagged (genuinely "didn't get to it")
+    #   2. Brands flagged with EXCLUDE_FROM_FINAL_FLAGS (wrong-logo / wrong-colour) —
+    #      reviewer marked them as needing re-work, so they don't ship and need re-sourcing
+    processed_folders = {f for f, _, _ in to_process}
     for folder, brand in by_folder.items():
-        if folder not in finalized_set and folder not in flagged_map:
-            not_processed.append({
-                "brand_name": brand.get("brand_name", ""),
-                "folder": folder,
-                "status": brand.get("status", ""),
-                "errors": "; ".join(brand.get("errors", []) or []),
-                "candidates_count": brand.get("logo_candidates_count", 0),
-            })
+        if folder in processed_folders:
+            continue
+        flag = flagged_map.get(folder, "")
+        not_processed.append({
+            "brand_name": brand.get("brand_name", ""),
+            "folder": folder,
+            "status": brand.get("status", ""),
+            "errors": "; ".join(brand.get("errors", []) or []),
+            "candidates_count": brand.get("logo_candidates_count", 0),
+            "flag_reason": flag,                      # NEW: tells reviewer why it ended up here
+            "reason": "excluded_by_flag" if flag in EXCLUDE_FROM_FINAL_FLAGS
+                      else ("review_pending" if not flag else "flagged"),
+        })
 
     # Write CSV
     csv_path = final_root / "brand_data.csv"
@@ -3497,7 +3524,8 @@ def _finalize(out_dir: Path, args) -> int:
         f"Recoloured: {sum(1 for o in outcomes if o.get('recolour'))}\n"
         f"Monochromized: {sum(1 for o in outcomes if o.get('monochrome'))}\n"
         f"Originals preserved: {sum(1 for o in outcomes if o.get('original_file'))}\n"
-        f"Passthrough (no modification): {sum(1 for o in outcomes if o.get('passthrough'))}\n\n"
+        f"Passthrough (no modification): {sum(1 for o in outcomes if o.get('passthrough'))}\n"
+        f"Excluded by flag (→ remaining_brands.csv): {len(excluded_by_flag)}\n\n"
         f"Per-brand JSON log:\n" + "\n".join(report_lines) + "\n"
     )
 
