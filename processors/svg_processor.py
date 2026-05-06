@@ -43,6 +43,90 @@ except ImportError:
 
 
 SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+
+# SVG element/attribute names that are case-sensitive and MUST be in camelCase
+# for browsers and design tools (Figma, Illustrator) to recognise them. When
+# lxml's recover-mode parser encounters malformed XML / HTML-flavoured input,
+# it may lowercase these — break gradients, clip paths, etc. We fix that on
+# serialize.
+_CAMEL_CASE_ELEMENTS = [
+    "clipPath", "linearGradient", "radialGradient", "foreignObject",
+    "textPath", "feGaussianBlur", "feOffset", "feMerge", "feMergeNode",
+    "feColorMatrix", "feComposite", "feFlood", "feBlend", "feImage",
+    "feDisplacementMap", "feSpotLight", "fePointLight", "feDistantLight",
+    "feTurbulence", "feMorphology", "feSpecularLighting", "feDiffuseLighting",
+    "feFuncR", "feFuncG", "feFuncB", "feFuncA", "feComponentTransfer",
+    "feConvolveMatrix", "feDropShadow", "feTile",
+    "animateTransform", "animateMotion",
+]
+_CAMEL_CASE_ATTRS = [
+    "viewBox", "preserveAspectRatio", "patternUnits", "patternContentUnits",
+    "patternTransform", "gradientUnits", "gradientTransform",
+    "clipPathUnits", "maskUnits", "maskContentUnits",
+    "primitiveUnits", "filterUnits", "filterRes",
+    "baseProfile", "contentScriptType", "contentStyleType",
+    "specularConstant", "specularExponent", "diffuseConstant",
+    "kernelMatrix", "kernelUnitLength", "stdDeviation", "tableValues",
+    "stitchTiles", "stopColor", "stopOpacity", "fillOpacity", "strokeOpacity",
+    "strokeWidth", "strokeLinecap", "strokeLinejoin", "strokeMiterlimit",
+    "strokeDasharray", "strokeDashoffset",
+    "textLength", "lengthAdjust", "spreadMethod", "calcMode",
+    "keyTimes", "keySplines", "repeatCount", "repeatDur",
+    "attributeName", "attributeType", "begin", "end", "min", "max",
+]
+
+
+def _post_serialize_fixup(svg_bytes: bytes) -> bytes:
+    """
+    Re-normalize SVG bytes so they're correct in strict renderers (browsers, Figma).
+
+    Fixes two classes of round-trip damage:
+
+    1. lxml-synthesized namespace prefixes (ns0:href, ns1:href, ...) → xlink:href.
+       Mac QuickLook resolves these leniently; browsers + Figma do not.
+
+    2. Lowercase casing of SVG element / attribute names (clippath, lineargradient,
+       viewbox, preserveaspectratio, ...). SVG is case-sensitive XML; lowercase
+       tags don't match clip-path="url(#...)" references → silent rendering fail.
+    """
+    s = svg_bytes
+
+    # --- 1. Namespace prefix normalization ----------------------------------
+    # If lxml emitted ns0/ns1/etc. for the xlink namespace, restore xlink:.
+    # Match xmlns:nsN="...xlink" first to identify the alias, then rewrite uses.
+    m = re.search(rb'xmlns:(ns\d+)="http://www\.w3\.org/1999/xlink"', s)
+    if m:
+        alias = m.group(1)
+        s = s.replace(b'xmlns:' + alias + b'="http://www.w3.org/1999/xlink"',
+                      b'xmlns:xlink="http://www.w3.org/1999/xlink"')
+        s = re.sub(rb'\b' + alias + rb':', b'xlink:', s)
+    # Even without the xmlns:nsN declaration, sometimes nsN:href appears alone
+    # alongside an xlink namespace declared on the parent. Catch those too.
+    s = re.sub(rb'\bns\d+:href\b', b'xlink:href', s)
+
+    # --- 2. Case-sensitive element & attribute normalization ----------------
+    # Element open/close tags: <clippath> → <clipPath>, </clippath> → </clipPath>
+    for elem in _CAMEL_CASE_ELEMENTS:
+        lower = elem.lower().encode()
+        canonical = elem.encode()
+        if lower == canonical:
+            continue
+        # Open tag (with attributes, self-closing, or no attrs)
+        s = re.sub(rb'<' + lower + rb'(\s|/|>)', b'<' + canonical + rb'\1', s)
+        # Close tag
+        s = s.replace(b'</' + lower + b'>', b'</' + canonical + b'>')
+
+    # Attribute names: viewbox → viewBox, etc.
+    for attr in _CAMEL_CASE_ATTRS:
+        lower = attr.lower().encode()
+        canonical = attr.encode()
+        if lower == canonical:
+            continue
+        # Attribute name followed by =, surrounded by whitespace/start of attrs
+        s = re.sub(rb'(\s|")' + lower + rb'=', rb'\1' + canonical + b'=', s)
+
+    return s
 
 
 # ─── DETECTION ───────────────────────────────────────────────────────────────
@@ -57,8 +141,41 @@ def is_svg(data: bytes) -> bool:
 
 # ─── PARSING HELPERS ─────────────────────────────────────────────────────────
 
+def _pre_parse_fixup(svg_bytes: bytes) -> bytes:
+    """
+    Normalise case-sensitive SVG element / attribute names BEFORE parsing.
+
+    Some sources serve SVGs with lowercase tags / attributes (e.g. `viewbox`,
+    `<clippath>`, `<lineargradient>`) — likely from HTML-flavoured exporters
+    or malformed source. If we let lxml parse those as-is and then add our
+    own canonical-case attribute (e.g. `root.set("viewBox", ...)`), both
+    versions coexist. Pre-normalising prevents that.
+    """
+    s = svg_bytes
+    for elem in _CAMEL_CASE_ELEMENTS:
+        lower = elem.lower().encode()
+        canonical = elem.encode()
+        if lower == canonical:
+            continue
+        s = re.sub(rb'<' + lower + rb'(\s|/|>)', b'<' + canonical + rb'\1', s)
+        s = s.replace(b'</' + lower + b'>', b'</' + canonical + b'>')
+    for attr in _CAMEL_CASE_ATTRS:
+        lower = attr.lower().encode()
+        canonical = attr.encode()
+        if lower == canonical:
+            continue
+        s = re.sub(rb'(\s|")' + lower + rb'=', rb'\1' + canonical + b'=', s)
+    return s
+
+
 def _parse(svg_bytes: bytes):
-    """Parse SVG bytes → (root, used_lxml). Strips BOMs and handles missing namespace."""
+    """Parse SVG bytes → root. Strips BOMs and handles missing namespace.
+
+    Pre-normalises case so lxml sees canonical attribute / element names, then
+    parses with recover=True so malformed SVGs still get through. The post-
+    serialize fixup acts as a final safety net.
+    """
+    svg_bytes = _pre_parse_fixup(svg_bytes)
     if HAS_LXML:
         parser = LET.XMLParser(remove_blank_text=False, recover=True)
         root = LET.fromstring(svg_bytes, parser)
@@ -68,13 +185,31 @@ def _parse(svg_bytes: bytes):
 
 
 def _serialize(root) -> bytes:
-    """Serialize root → bytes with proper XML declaration and SVG namespace."""
+    """Serialize root → bytes with namespace + case-sensitivity fixups applied."""
     if HAS_LXML:
-        return LET.tostring(root, xml_declaration=False, encoding="utf-8")
+        # Ensure xlink prefix is registered on the root if any descendant uses it.
+        # Without this, lxml synthesises ns0/ns1 prefixes which break gradient
+        # cross-references in browsers and Figma.
+        try:
+            uses_xlink = any(
+                k for k in root.nsmap.values() if k == XLINK_NS
+            ) or root.xpath("//*[@xlink:href or @ns0:href or @ns1:href]",
+                            namespaces={"xlink": XLINK_NS, "ns0": XLINK_NS, "ns1": XLINK_NS})
+            if uses_xlink and "xlink" not in (root.nsmap or {}):
+                # Re-create root with proper nsmap — preserves descendants
+                new_nsmap = dict(root.nsmap or {})
+                new_nsmap["xlink"] = XLINK_NS
+                # nsmap is immutable on existing element; we use cleanup_namespaces
+                LET.cleanup_namespaces(root, top_nsmap=new_nsmap)
+        except Exception:
+            # Best-effort; fixup pass below will catch what we missed
+            pass
+        raw = LET.tostring(root, xml_declaration=False, encoding="utf-8")
     else:
-        # ElementTree adds ns0: prefix sometimes — register first
         LET.register_namespace("", SVG_NS)
-        return LET.tostring(root, encoding="utf-8")
+        LET.register_namespace("xlink", XLINK_NS)
+        raw = LET.tostring(root, encoding="utf-8")
+    return _post_serialize_fixup(raw)
 
 
 def _strip_namespace(tag: str) -> str:
