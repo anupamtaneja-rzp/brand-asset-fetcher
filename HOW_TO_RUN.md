@@ -1,4 +1,4 @@
-# How to Run the Brand Asset Pipeline v7.2
+# How to Run the Brand Asset Pipeline v7.12
 
 ## What you'll get
 A folder (e.g. `batch_1_assets/`) with:
@@ -10,22 +10,33 @@ A folder (e.g. `batch_1_assets/`) with:
 - **pipeline.log** — detailed debug log (fetch errors, HTTP statuses, tier diagnostics)
 
 After finalizing (separate step):
-- **`<output>_final.zip`** — production-quality assets. Logos are passed through in their original format when no manipulation is needed (WebP stays WebP, JPEG stays JPEG, etc.) — and converted to PNG only when you've requested recolour, monochromize, or upscale.
+- **`<output>_final.zip`** — production-quality assets. Restricted to PNG/JPG/WebP/SVG only (AVIF/GIF/BMP/TIFF/ICO get auto-converted to PNG). Logos are passed through in their original format when no manipulation is requested (WebP stays WebP, JPEG stays JPEG, etc.) — and converted to PNG when recolour/monochromize/upscale was applied. Sizing is adaptive: opted-in upscaled brands ship at 500×500, all others at native resolution capped at 1024×1024.
+- **`originals/<BrandName>.<ext>`** folder inside the ZIP — for any brand that was modified (upscaled / recoloured / monochromized), the untouched raw fetched file is included alongside so engineering can compare against the AI-modified output if quality issues come up.
 
-### What changed in v7.2
-- **Original raster format preserved end-to-end** — WebP/JPEG/AVIF logos stay as `.webp`/`.jpg`/`.avif` in raw/ AND in the final ZIP (when no manipulation is requested). Zero re-encoding loss. Pass-through copy at finalize when reviewer didn't recolour/monochromize/upscale.
-- **Upscaling is now opt-in per brand** — pipeline never auto-flags. Default: nothing upscales. Reviewer ticks "Upscale this logo 4x at finalize" in the detail panel for any brand they want upscaled. Resolution badge in the grid shows `↑4x` only on opted-in logos.
-- **`merchant_id` and `merchant_email` passthrough** — extra columns from your input CSV (e.g. `merchant_id`, `merchant_email`) are carried through to the final `brand_data.csv`, so you can map back to your CRM.
-- **WebP/JPEG/AVIF accepted from Wikimedia** — tier 3 search no longer hard-filters to SVG+PNG.
-- **SVG bbox letterbox fix** — non-square SVGs (wordmarks like Vodafone/IndiGo) no longer render off-centre or cropped after viewBox normalization.
+### What changed in v7.12 (latest)
+- **SVG namespace / case-sensitivity fixes** — Three-layer fix for SVGs that Mac QuickLook rendered fine but browsers/Figma broke on. Pre-parse normalises lowercase tag names (`<clippath>` → `<clipPath>`, `viewbox` → `viewBox`, `<feoffset>` → `<feOffset>`). Post-serialize restores camelCase for ~30 known SVG element names + ~40 attributes, plus rewrites lxml's synthesised `nsN:href` back to `xlink:href`. Covers `clipPath`, `linearGradient`, `radialGradient`, all `fe*` filter primitives, `foreignObject`, `textPath`, `animateTransform`, etc.
+- **Adaptive canvas sizing** (v7.9) — opted-in upscaled brands ship at 500×500; non-upscaled brands keep native resolution with a soft cap at 1024×1024 (LANCZOS downscale only for sources > 1024px).
+- **Exclude wrong-logo / wrong-colour flags from final ZIP** (v7.10) — these flag reasons now route the brand to `remaining_brands.csv` with `reason=excluded_by_flag` instead of shipping into a `flagged_*/` subfolder.
+- **Description columns populate correctly** (v7.11) — `brand_description` and `translation_short_description` get the scraped meta tag; `translation_description` gets longer scraped homepage text. (Previously these columns were silently empty due to a field-name typo.)
+- **`--prep-upscale` mode** (v7.8) — when Upscayl's CLI is producing bad output (model-load issues, GPU contention, AVIF input rejection), this exports a flat folder of files for you to run through Upscayl's batch UI manually. `--finalize` then picks up your manual upscales from `_upscale_done/` automatically.
+- **Padding is now percentage-of-canvas** (v7.8) — default `--padding-pct 12` means 12% padding per side. On a 500×500 canvas that's ~60px; on 1024×1024 it's ~123px. Old `--padding` flag still works (now means percent).
+- **`originals/` folder in the ZIP** (v7.3) — for every brand you modified (upscaled / recoloured / monochromized), the raw original is bundled alongside the modified final, so quality issues can be A/B compared and reverted.
+- **Output formats locked** (v7.5) — final ZIP only contains PNG / JPG / WebP / SVG. AVIF, GIF, BMP, TIFF, ICO sources are auto-converted to PNG (alpha-preserving) at finalize.
 
-### What changed in v7 (carried forward)
-- **Two-stage processing**: light pass during sourcing (padding/squaring), heavy pass on shortlisted finalists only (upscaling + DOM-based SVG recolour). Saves time — you don't upscale candidates you'll reject.
-- **Server-side SVG processing** — proper XML parsing replaces the old regex approach. Recolouring now handles inline `style=""`, `<style>` blocks, gradient stops, and CSS classes correctly.
-- **Auto padding & square canvas** — every candidate gets 12px padding on a square canvas during sourcing. What you see in review is what you'll ship.
-- **Upscayl integration** — `realesrgan-ncnn-vulkan` via the bundled Upscayl app binary. Edge-preserving model tuned for logos.
-- **`--finalize` command** — separate mode that reads your saved review session and produces the production-quality ZIP for engineering handoff.
-- **Raster monochromize** — alpha-preserving lossless silhouette conversion to black or white via in-browser preview, baked at finalize.
+### What changed in v7.2 (carried forward)
+- **Original raster format preserved end-to-end** — WebP/JPEG logos stay as `.webp`/`.jpg` in raw/ AND in the final ZIP (when no manipulation is requested). Zero re-encoding loss.
+- **Upscaling is opt-in per brand** — reviewer ticks "Upscale this logo 4x at finalize" in the detail panel. Default: nothing upscales.
+- **`merchant_id` and `merchant_email` passthrough** — carried from input CSV to the final `brand_data.csv` for CRM mapping.
+- **WebP/JPEG/AVIF accepted from Wikimedia** (tier 3 no longer hard-filters to SVG+PNG).
+- **SVG bbox letterbox fix** — non-square SVGs (wordmarks) no longer crop / off-centre.
+
+### What changed in v7 (foundation)
+- **Two-stage processing**: light pass during sourcing (padding/squaring), heavy pass on shortlisted finalists only.
+- **Server-side SVG processing via lxml** — proper XML parsing replaces regex. Recolouring handles inline `style=""`, `<style>` CSS blocks, gradient stops, and CSS classes.
+- **Auto padding & square canvas** for every candidate during sourcing.
+- **Upscayl integration** via `realesrgan-ncnn-vulkan` — `digital-art-4x` model for logos.
+- **`--finalize` command** — separate mode for production ZIP.
+- **Raster monochromize** — alpha-preserving lossless silhouette to black or white.
 
 ### Carried over from v6
 - All candidates saved at full quality in `candidates/` subfolder; sources from all 9 tiers automatically
@@ -59,18 +70,60 @@ For each brand in the grid:
 Periodically click **Save Session** — downloads `review_session.json` to your Downloads folder. When fully done, **move `review_session.json` into the `batch_1_assets/` folder**, then press `Ctrl+C` in the terminal to stop the server.
 
 ### Phase 3 — Finalize for engineering handoff (5–10 min)
+
+**Two paths depending on Upscayl's auto-mode reliability:**
+
+**Path A — Auto-upscale (default, when Upscayl's CLI works cleanly):**
 ```bash
 python brand_asset_pipeline.py --finalize batch_1_assets --upscale --threads 4
 ```
-Reads your session and:
-- For SVGs: applies DOM-based recolour (handles inline styles, gradient stops, etc.) and writes `.svg`
-- For rasters you opted into upscaling: runs Upscayl 4x, then applies monochromize/pad as requested, writes `.png`
-- For rasters with no manipulation requested: **pass-through copy** of the original file in its native format (`.webp` stays `.webp`, etc.)
-- Builds `batch_1_assets_final.zip` with the Reward Catalogue CSV (including `merchant_id` and `merchant_email` passthrough)
+Pipeline runs Upscayl as a subprocess for each opted-in brand. Fast but depends on the model being installed and behaving (some Upscayl versions silently produce black output — see Path B).
 
-Send that ZIP to engineering.
+**Path B — Manual batch upscale via Upscayl's UI (recommended for production runs):**
+```bash
+# 1. Export files for batch upscaling
+python brand_asset_pipeline.py --prep-upscale batch_1_assets
+```
+This creates `batch_1_assets/_upscale_pending/` with one file per brand you opted into upscaling (AVIF/GIF auto-converted to PNG for Upscayl compatibility).
 
-> **Tip:** if you don't pass `--upscale`, the pipeline still runs and just warns about any brands you opted in. Use that for a "no upscale" preview run, then re-finalize with `--upscale` once Upscayl is installed.
+2. Open **Upscayl** → toggle **Batch Upscayl** mode → select `_upscale_pending/` as input → set output to `batch_1_assets/_upscale_done/` → pick **Digital Art 4x** model → run.
+
+3. When Upscayl finishes:
+```bash
+python brand_asset_pipeline.py --finalize batch_1_assets --upscale --threads 4
+```
+`--finalize` automatically detects your manually-upscaled files in `_upscale_done/` and uses them instead of calling Upscayl as a subprocess. CSV records `upscaled_via: manual` for these brands.
+
+---
+
+**What finalize does to each brand:**
+- **SVGs**: applies DOM-based recolour (handles inline styles, `<style>` blocks, gradient stops, `xlink:href` references, camelCase tags like `clipPath`/`linearGradient`/`feOffset`). Writes `.svg`.
+- **Rasters in `forceUpscale` set**: uses your manual upscale from `_upscale_done/` if present, else runs Upscayl subprocess. Pads to **500×500** square (12% padding ≈ 60px per side). Writes `.png`.
+- **Rasters not opted into upscale**: keeps native resolution, pads to square with 12% padding, **soft-caps at 1024×1024** (anything bigger gets LANCZOS-downscaled). Preserves WebP format if source was WebP; otherwise PNG. AVIF/GIF/BMP/TIFF/ICO sources get converted to PNG.
+- **Originals folder**: every brand with a manipulation (upscale / recolour / monochromize) also gets its raw fetched file copied to `originals/<BrandName>.<ext>` for A/B comparison.
+
+**Flag handling:**
+- `wrong-logo` / `wrong-colour` flagged brands → **excluded** from the ZIP, listed in `remaining_brands.csv` with `reason=excluded_by_flag`.
+- `needs-upscaling` / `other` flagged brands → ship into `flagged_*/` subfolders for engineering to inspect.
+
+Final output: `batch_1_assets_final.zip`. Send to engineering.
+
+> **Tip:** if you don't pass `--upscale`, the pipeline still runs and just warns about any brands you opted in. Use that for a "no upscale" preview run.
+
+### Optional: clean up copy descriptions before shipping
+
+Pipeline auto-populates `brand_description` (≤100 chars), `translation_short_description` (mirrored), and `translation_description` (longer scraped homepage text). The scraped meta description is sometimes too long, mid-thought, or includes navigation cruft. Run the cleanup script:
+
+```bash
+python3 clean_brand_data.py batch_1_assets_final.zip
+# (or pass the brand_data.csv directly — script auto-detects)
+```
+
+This produces:
+- `brand_data_cleaned.csv` — descriptions truncated/rewritten to ≤100 chars, navigation cruft stripped, identical content in both `brand_description` and `translation_short_description`.
+- `brand_data_review_needed.csv` — rows flagged for manual review (low-confidence rewrites, empty descriptions filled from category templates).
+
+Review the flagged rows manually, then merge edits back. See `COPY_GUIDELINES.md` for the full spec on column character limits and tone.
 
 ---
 
@@ -271,14 +324,18 @@ batch_1_assets/
 | `--serve` | off | Start review server only (no pipeline) |
 | `--no-serve` | off | Skip auto-server after pipeline run |
 | `--port N` | `4200` | Port for the review server |
-| `--padding N` | `12` | Pixels of padding around the logo on the square canvas |
-| `--canvas-size N` | `512` | Output square canvas size (px) for normalized assets |
+| `--padding-pct N` (alias `--padding`) | `12` | Padding as percentage of canvas size per side (12 = 12%). On 500 canvas ≈ 60px; on 1024 ≈ 123px. |
+| `--padding-px N` | (auto) | Absolute padding override in pixels (overrides `--padding-pct`). Advanced use only. |
+| `--canvas-size N` | `512` | Output canvas size (px) for normalized preview files in `candidates/` |
+| `--final-canvas-size N` | `500` | Target canvas size for brands opted into upscale at finalize. |
+| `--final-canvas-cap N` | `1024` | Soft cap for non-upscaled brands at finalize — anything bigger gets LANCZOS-downscaled. |
 | `--finalize DIR` | — | Run Phase 3 on a sourced+reviewed folder. Reads `review_session.json` from the folder. |
-| `--upscale` | off | Enable Upscayl 4x upscaling for rasters under 500px (Phase 3 only) |
-| `--no-upscale` | — | Explicitly disable upscaling (overrides `--upscale`) |
-| `--upscale-threshold N` | `500` | Minimum dimension (px) below which a raster gets upscaled |
-| `--upscale-model NAME` | `realesrgan-x4plus-anime` | Upscayl model — `anime` preserves logo edges best |
-| `--upscayl-bin PATH` | (auto) | Override path to `realesrgan-ncnn-vulkan` binary if auto-detect fails |
+| `--prep-upscale DIR` | — | Export `_upscale_pending/` folder for manual Upscayl batch UI processing. Use when auto-upscale is unreliable. |
+| `--upscale` | off | Enable Upscayl 4x upscaling for brands the reviewer opted in (Phase 3 only). |
+| `--no-upscale` | — | Explicitly disable upscaling (overrides `--upscale`). |
+| `--upscale-threshold N` | `500` | Reserved — used by legacy auto-flag logic. Per-brand opt-in is now the canonical control. |
+| `--upscale-model NAME` | `digital-art-4x` | Upscayl model — `digital-art-4x` is the right pick for logos / line art / typography. Auto-fallback if missing. |
+| `--upscayl-bin PATH` | (auto) | Override path to Upscayl binary if auto-detect at `/Applications/Upscayl.app/Contents/Resources/bin/upscayl-bin` fails. |
 
 ---
 
@@ -332,4 +389,19 @@ Two things must both be true: (1) you ticked "Upscale this logo 4x at finalize" 
 After reviewing in the browser, click **Save Session** and move the downloaded JSON file into your output folder (e.g. `batch_1_assets/review_session.json`). Then re-run `--finalize`.
 
 **SVG recolour looks wrong in the final ZIP**
-The `--finalize` command uses proper DOM parsing — it should handle inline styles, CSS blocks, and gradients correctly. If a specific SVG still looks wrong, check `finalize_report.txt` in the output for that brand's processing log. Worst case, the pipeline preserves the original SVG so you can hand-fix it.
+The `--finalize` command uses proper DOM parsing — it should handle inline styles, CSS blocks, and gradients correctly. If a specific SVG still looks wrong, check `finalize_report.txt` in the output for that brand's processing log. Worst case, the pipeline preserves the original SVG in `originals/<BrandName>.svg` so you can hand-fix it.
+
+**SVG renders in Mac QuickLook but breaks in browsers / Figma (gradients invisible, drop shadows missing)**
+This was a v7.11 bug — fixed in v7.12. Symptoms: gradient cross-references (`xlink:href`) became `ns0:href`/`ns1:href`, and filter primitives (`<feOffset>`, `<feColorMatrix>`, `clipPath`) got lowercased through the lxml round-trip. Mac QuickLook is lenient and renders these anyway; browsers and Figma are strict and silently fail. **Fix:** make sure you're on v7.12+ of `svg_processor.py`. Quick check: `grep -c "_pre_parse_fixup\|feColorMatrix" processors/svg_processor.py` should print a non-zero number. If it prints 0, re-download `processors/svg_processor.py` from the latest bundle.
+
+**Manual upscale via Upscayl — files in `_upscale_done/` not being picked up at finalize**
+File naming matters. Each file must start with the brand's folder slug (e.g. `bisleri.png` or `bisleri_upscaled.png` for the `bisleri/` brand folder). If Upscayl renamed your output with a non-matching prefix, rename the files to match the folder slugs in `pipeline_summary.json`.
+
+**`pipeline_summary.json` has folder=None for all brands → finalize processes only 3 brands**
+This is a sourcing-time bug from older runs. Quick fix: run the rebuild utility against your output folder, which rebuilds `pipeline_summary.json` from each brand subfolder's `meta.json`:
+
+```bash
+python3 rebuild_summary.py final_assets
+```
+
+Then re-run `--finalize` — it'll now find all your sourced brands.
